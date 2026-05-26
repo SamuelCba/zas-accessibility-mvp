@@ -160,10 +160,12 @@ public class ZasAccessibilityService extends AccessibilityService {
             if (!amountFieldPrepared) {
                 showStatus("No pude preparar monto");
                 nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
+                scheduleRetry(ACTION_DELAY_MS);
                 return false;
             }
             showStatus("Monto listo para escribir");
             nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
+            scheduleRetry(ACTION_DELAY_MS);
             return false;
         }
 
