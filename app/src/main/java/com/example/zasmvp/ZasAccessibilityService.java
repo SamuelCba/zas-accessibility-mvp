@@ -1,13 +1,19 @@
 package com.example.zasmvp;
 
 import android.accessibilityservice.AccessibilityService;
+import android.content.ContentUris;
 import android.content.Intent;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -18,67 +24,81 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.RGBLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.HybridBinarizer;
+import com.google.zxing.qrcode.QRCodeReader;
+
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 public class ZasAccessibilityService extends AccessibilityService {
-    private static final String TAG = "ZasService";
+
+    private static final String TAG         = "ZasService";
     private static final String ZAS_PACKAGE = "bec.vdb.direct";
-    private static final long ACTION_DELAY_MS = 900L;
+    private static final long   ACTION_DELAY_MS = 900L;
+    private static final long   POLL_INTERVAL_MS = 3000L;
+    static final String         ACTION_HISTORY_UPDATED = "com.example.zasmvp.HISTORY_UPDATED";
+
     private static ZasAccessibilityService instance;
-    private enum State { IDLE, EDITING, FILLING, CONFIGURING, GENERATING, WAITING_FOR_SAVE, SAVING, RESETTING }
-    private State state = State.IDLE;
+
+    private enum State {
+        IDLE, EDITING, FILLING, CONFIGURING, GENERATING,
+        WAITING_FOR_SAVE, DECODING, SAVING, RESETTING
+    }
+
+    private State   state = State.IDLE;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private String amt = "5.00";
-    private String ref = "PAGO_AUTO";
+
+    private String  amt = "5.00";
+    private String  ref = "PAGO_AUTO";
     private boolean validitySelected;
     private boolean singleUseEnabled;
     private boolean amountFieldPrepared;
     private boolean keyboardDismissed;
-    private long nextActionAtMs;
+    private long    nextActionAtMs;
+
+    private BackendClient.TopupData currentTopup;
+    private long    preGenQrDateAdded; // DATE_ADDED of newest QR before we started generating
+
     private WindowManager windowManager;
-    private TextView statusPopup;
+    private TextView      statusPopup;
     private final Runnable hidePopupRunnable = this::hidePopup;
-    private final Runnable retryRunnable = this::retryProcess;
+    private final Runnable retryRunnable     = this::retryProcess;
+    private final Runnable pollRunnable      = this::doPoll;
 
     public static ZasAccessibilityService getInstance() { return instance; }
 
-    @Override protected void onServiceConnected() {
+    // ─── Lifecycle ──────────────────────────────────────────────────────────
+
+    @Override
+    protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         showStatus("Servicio ZAS conectado");
+        schedulePoll(POLL_INTERVAL_MS);
     }
 
     @Override
     public boolean onUnbind(Intent intent) {
         hidePopup();
-        mainHandler.removeCallbacks(retryRunnable);
+        mainHandler.removeCallbacksAndMessages(null);
         if (instance == this) instance = null;
         return super.onUnbind(intent);
     }
 
-    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
-        String pkg = event.getPackageName() != null ? event.getPackageName().toString() : "";
-        if (pkg.equals(ZAS_PACKAGE)) {
-            Log.d(TAG, "Evento detectado en ZAS: " + event.getEventType());
-            if (state != State.IDLE && shouldProcessEvent(event.getEventType())) {
-                process(getRootInActiveWindow());
-            }
-        }
-    }
+    @Override public void onInterrupt() {}
+
+    // ─── Public API ─────────────────────────────────────────────────────────
 
     public void startAutoFlow(String amt, String ref) {
-        this.state = State.EDITING;
-        this.amt = sanitizeAmount(amt);
-        this.ref = sanitizeReference(ref);
-        this.validitySelected = false;
-        this.singleUseEnabled = false;
-        this.amountFieldPrepared = false;
-        this.keyboardDismissed = false;
-        this.nextActionAtMs = 0L;
-        mainHandler.removeCallbacks(retryRunnable);
+        mainHandler.removeCallbacks(pollRunnable);
+        resetFlowState(amt, ref);
+        state = State.EDITING;
         showStatus("Iniciando automatizacion");
         Intent i = getPackageManager().getLaunchIntentForPackage(ZAS_PACKAGE);
         if (i == null) {
@@ -89,63 +109,221 @@ public class ZasAccessibilityService extends AccessibilityService {
         startActivity(i);
     }
 
+    // ─── Backend polling ────────────────────────────────────────────────────
+
+    private void schedulePoll(long delayMs) {
+        mainHandler.removeCallbacks(pollRunnable);
+        mainHandler.postDelayed(pollRunnable, delayMs);
+    }
+
+    private void doPoll() {
+        if (state != State.IDLE) { schedulePoll(POLL_INTERVAL_MS); return; }
+        String token = BackendClient.token(this);
+        if (token.isEmpty()) { schedulePoll(POLL_INTERVAL_MS); return; }
+
+        new Thread(() -> {
+            try {
+                BackendClient.TopupData topup = BackendClient.getNextTopup(this);
+                mainHandler.post(() -> {
+                    if (topup != null && state == State.IDLE) {
+                        currentTopup = topup;
+                        startAutoFlow(topup.amount, topup.reference);
+                    } else {
+                        schedulePoll(POLL_INTERVAL_MS);
+                    }
+                });
+            } catch (Exception e) {
+                Log.w(TAG, "poll error: " + e.getMessage());
+                mainHandler.postDelayed(pollRunnable, POLL_INTERVAL_MS);
+            }
+        }).start();
+    }
+
+    // ─── Accessibility events ────────────────────────────────────────────────
+
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        String pkg = event.getPackageName() != null ? event.getPackageName().toString() : "";
+        if (pkg.equals(ZAS_PACKAGE) && state != State.IDLE && shouldProcessEvent(event.getEventType())) {
+            process(getRootInActiveWindow());
+        }
+    }
+
+    private boolean shouldProcessEvent(int t) {
+        return t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            || t == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            || t == AccessibilityEvent.TYPE_VIEW_CLICKED
+            || t == AccessibilityEvent.TYPE_VIEW_SCROLLED
+            || t == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED;
+    }
+
+    // ─── State machine ───────────────────────────────────────────────────────
+
     private void process(AccessibilityNodeInfo root) {
         if (root == null) return;
         if (System.currentTimeMillis() < nextActionAtMs) return;
 
         switch (state) {
             case EDITING:
-                if (openEditor(root)) {
-                    advance(State.FILLING, ACTION_DELAY_MS, "Entrando al editor");
-                }
+                if (openEditor(root)) advance(State.FILLING, ACTION_DELAY_MS, "Entrando al editor");
                 break;
             case FILLING:
-                if (fillForm(root)) {
-                    advance(State.CONFIGURING, ACTION_DELAY_MS, "Monto y motivo listos");
-                }
+                if (fillForm(root)) advance(State.CONFIGURING, ACTION_DELAY_MS, "Monto y motivo listos");
                 break;
             case CONFIGURING:
-                if (configureForm(root)) {
-                    advance(State.GENERATING, ACTION_DELAY_MS, "Configuracion completa");
-                }
+                if (configureForm(root)) advance(State.GENERATING, ACTION_DELAY_MS, "Configuracion completa");
                 break;
             case GENERATING:
-                if (clickByLabels(root, "Generar")) {
-                    advance(State.WAITING_FOR_SAVE, 1500L, "Generando QR");
-                }
+                preGenQrDateAdded = getLatestQrDateAdded();
+                if (clickByLabels(root, "Generar")) advance(State.WAITING_FOR_SAVE, 1500L, "Generando QR");
                 break;
             case WAITING_FOR_SAVE:
-                if (saveResult(root)) {
-                    advance(State.SAVING, ACTION_DELAY_MS, "Guardando QR");
-                }
+                if (saveResult(root)) advance(State.DECODING, ACTION_DELAY_MS, "QR guardado, decodificando");
+                break;
+            case DECODING:
+                // handled by background thread started in advance()
                 break;
             case SAVING:
-                if (openEditor(root)) {
-                    advance(State.RESETTING, ACTION_DELAY_MS, "Volviendo a limpiar");
-                }
+                if (openEditor(root)) advance(State.RESETTING, ACTION_DELAY_MS, "Volviendo a limpiar");
                 break;
             case RESETTING:
                 if (clickByLabels(root, "Limpiar")) {
-                    showStatus("Proceso finalizado");
+                    showStatus("Ciclo finalizado");
                     state = State.IDLE;
+                    schedulePoll(POLL_INTERVAL_MS);
                 }
                 break;
         }
     }
 
-    private boolean fillForm(AccessibilityNodeInfo root) {
-        Log.d(TAG, "DEBUG: FILLING STATE. Total Nodes: " + countNodes(root));
-        StringBuilder sb = new StringBuilder();
-        dumpNode(root, 0, sb, 0, 160);
-        Log.d(TAG, sb.toString());
+    private void advance(State newState, long delayMs, String status) {
+        state = newState;
+        nextActionAtMs = System.currentTimeMillis() + delayMs;
+        showStatus(status);
+        if (newState == State.DECODING) {
+            startDecodeAndSubmit();
+        } else {
+            scheduleRetry(delayMs);
+        }
+    }
 
-        AccessibilityNodeInfo amountField = findFieldByKeywords(root,
-                "monto", "importe", "amount", "valor");
-        AccessibilityNodeInfo referenceField = findFieldByKeywords(root,
-                "motivo", "referencia", "detalle", "descripcion", "glosa", "concepto");
+    // ─── Decode & submit (background) ────────────────────────────────────────
+
+    private void startDecodeAndSubmit() {
+        new Thread(() -> {
+            // Wait for gallery to pick up the new image
+            sleep(2500);
+
+            String payload = null;
+            long deadline = System.currentTimeMillis() + 10000;
+            while (System.currentTimeMillis() < deadline) {
+                payload = findAndDecodeNewQr(preGenQrDateAdded);
+                if (payload != null) break;
+                sleep(1200);
+            }
+
+            final String qrPayload   = payload != null ? payload : "";
+            final boolean hasPayload  = !qrPayload.isEmpty();
+
+            if (hasPayload) {
+                Log.i(TAG, "QR decodificado: " + qrPayload);
+            } else {
+                Log.w(TAG, "No se pudo decodificar QR nuevo");
+            }
+
+            boolean submitted = false;
+            if (hasPayload && currentTopup != null) {
+                try {
+                    submitted = BackendClient.submitQrPayload(this, currentTopup.id, qrPayload);
+                    Log.i(TAG, "Submit result: " + submitted);
+                } catch (Exception e) {
+                    Log.e(TAG, "Submit error: " + e.getMessage());
+                }
+            }
+
+            // Save to history
+            if (currentTopup != null) {
+                HistoryEntry entry = new HistoryEntry();
+                entry.topupId     = currentTopup.id;
+                entry.amount      = currentTopup.amount;
+                entry.reference   = currentTopup.reference;
+                entry.concept     = currentTopup.concept;
+                entry.qrPayload   = qrPayload;
+                entry.timestampMs = System.currentTimeMillis();
+                entry.submitted   = submitted;
+                HistoryStorage.add(this, entry);
+                sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
+            }
+
+            final boolean finalSubmitted = submitted;
+            mainHandler.post(() -> {
+                showStatus(finalSubmitted ? "QR enviado OK" : (hasPayload ? "QR decoded, submit fallido" : "Sin QR, continuando"));
+                currentTopup = null;
+                advance(State.SAVING, ACTION_DELAY_MS, "Limpiando formulario");
+            });
+        }).start();
+    }
+
+    // ─── MediaStore + ZXing ──────────────────────────────────────────────────
+
+    private long getLatestQrDateAdded() {
+        String[] proj = {MediaStore.Images.Media.DATE_ADDED};
+        String sel = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'";
+        try (Cursor c = getContentResolver().query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, sel, null,
+                MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+            if (c != null && c.moveToFirst()) {
+                return c.getLong(0);
+            }
+        } catch (Exception ignored) {}
+        return 0;
+    }
+
+    private String findAndDecodeNewQr(long afterDateAdded) {
+        String[] proj = {MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED};
+        String sel = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'"
+                   + " AND " + MediaStore.Images.Media.DATE_ADDED + " > " + afterDateAdded;
+        try (Cursor c = getContentResolver().query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, sel, null,
+                MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+            if (c != null && c.moveToFirst()) {
+                long id  = c.getLong(0);
+                Uri uri  = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                return decodeQrUri(uri);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "MediaStore query error: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private String decodeQrUri(Uri uri) {
+        try (InputStream is = getContentResolver().openInputStream(uri)) {
+            if (is == null) return null;
+            Bitmap bmp = BitmapFactory.decodeStream(is);
+            if (bmp == null) return null;
+            int w = bmp.getWidth(), h = bmp.getHeight();
+            int[] pixels = new int[w * h];
+            bmp.getPixels(pixels, 0, w, 0, 0, w, h);
+            bmp.recycle();
+            RGBLuminanceSource src = new RGBLuminanceSource(w, h, pixels);
+            BinaryBitmap bin = new BinaryBitmap(new HybridBinarizer(src));
+            Result result = new QRCodeReader().decode(bin);
+            return result.getText();
+        } catch (Exception e) {
+            Log.w(TAG, "ZXing decode error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ─── Form interaction ────────────────────────────────────────────────────
+
+    private boolean fillForm(AccessibilityNodeInfo root) {
+        AccessibilityNodeInfo amountField = findFieldByKeywords(root, "monto", "importe", "amount", "valor");
+        AccessibilityNodeInfo referenceField = findFieldByKeywords(root, "motivo", "referencia", "detalle", "descripcion", "glosa", "concepto");
 
         List<AccessibilityNodeInfo> fields = collectEditableFields(root);
-        if (amountField == null && fields.size() > 0) amountField = fields.get(0);
+        if (amountField == null && !fields.isEmpty()) amountField = fields.get(0);
         if (referenceField == null && fields.size() > 1) {
             referenceField = fields.get(amountField == fields.get(0) ? 1 : 0);
         }
@@ -177,9 +355,8 @@ public class ZasAccessibilityService extends AccessibilityService {
         }
 
         sleep(250);
-
         boolean refOk = setText(referenceField, ref);
-        Log.d(TAG, "Resultado fillForm amountOk=" + amountOk + " refOk=" + refOk);
+
         if (amountOk && refOk) {
             amountFieldPrepared = false;
             if (!keyboardDismissed) {
@@ -195,11 +372,39 @@ public class ZasAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    private int countNodes(AccessibilityNodeInfo n) {
-        if (n == null) return 0;
-        int count = 1;
-        for (int i = 0; i < n.getChildCount(); i++) count += countNodes(n.getChild(i));
-        return count;
+    private boolean configureForm(AccessibilityNodeInfo root) {
+        if (!validitySelected) {
+            if (clickByLabels(root, "1 dia", "1 día")) {
+                validitySelected = true;
+                keyboardDismissed = true;
+                nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
+                showStatus("Validez: 1 dia");
+                scheduleRetry(ACTION_DELAY_MS);
+                return false;
+            }
+            AccessibilityNodeInfo vc = findClickableNodeByKeywords(root, "validez", "vigencia", "vencimiento");
+            if (vc != null && performClick(vc)) {
+                nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
+                showStatus("Abriendo selector validez");
+                scheduleRetry(ACTION_DELAY_MS);
+            }
+            return false;
+        }
+
+        if (!singleUseEnabled) {
+            AccessibilityNodeInfo toggle = findSingleUseToggle(root);
+            if (toggle == null) return false;
+            if (!isChecked(toggle)) {
+                if (!performClick(toggle)) return false;
+                nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
+                showStatus("Activando un solo uso");
+                scheduleRetry(ACTION_DELAY_MS);
+                return false;
+            }
+            singleUseEnabled = true;
+        }
+
+        return true;
     }
 
     private boolean openEditor(AccessibilityNodeInfo root) {
@@ -212,80 +417,99 @@ public class ZasAccessibilityService extends AccessibilityService {
         return clickBottom(root, 1);
     }
 
-    private boolean configureForm(AccessibilityNodeInfo root) {
-        if (!validitySelected) {
-            if (clickByLabels(root, "1 dia", "1 día")) {
-                validitySelected = true;
-                keyboardDismissed = true;
-                nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
-                showStatus("Validez seleccionada: 1 dia");
-                scheduleRetry(ACTION_DELAY_MS);
-                return false;
-            }
+    // ─── Helper methods ──────────────────────────────────────────────────────
 
-            AccessibilityNodeInfo validityControl = findClickableNodeByKeywords(root,
-                    "validez", "vigencia", "vencimiento", "duracion", "duración");
-            if (validityControl != null && performClick(validityControl)) {
-                nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
-                showStatus("Abriendo selector de validez");
-                scheduleRetry(ACTION_DELAY_MS);
-                return false;
-            }
+    private void resetFlowState(String newAmt, String newRef) {
+        this.amt              = sanitizeAmount(newAmt);
+        this.ref              = sanitizeReference(newRef);
+        this.validitySelected = false;
+        this.singleUseEnabled = false;
+        this.amountFieldPrepared = false;
+        this.keyboardDismissed = false;
+        this.nextActionAtMs   = 0L;
+        mainHandler.removeCallbacks(retryRunnable);
+    }
 
-            Log.d(TAG, "No se encontro selector de validez en esta ventana");
-            return false;
+    private boolean primeAmountField(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        boolean f = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        sleep(260);
+        boolean s = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        sleep(260);
+        return f || s;
+    }
+
+    private boolean setText(AccessibilityNodeInfo node, String value) {
+        if (node == null) return false;
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        sleep(180);
+        Bundle clear = new Bundle();
+        clear.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "");
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clear);
+        sleep(120);
+        Bundle args = new Bundle();
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
+        boolean ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+        sleep(180);
+        return ok || value.equals(safe(node.getText()));
+    }
+
+    private boolean clickByLabels(AccessibilityNodeInfo root, String... labels) {
+        for (String label : labels) {
+            AccessibilityNodeInfo node = findLabel(root, label);
+            if (node != null && performClick(node)) return true;
         }
+        return false;
+    }
 
-        if (!singleUseEnabled) {
-            AccessibilityNodeInfo toggle = findSingleUseToggle(root);
-            if (toggle == null) {
-                Log.d(TAG, "No se encontro switch de un solo uso");
-                return false;
-            }
-
-            if (!isChecked(toggle)) {
-                if (!performClick(toggle)) return false;
-                nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
-                showStatus("Activando un solo uso");
-                scheduleRetry(ACTION_DELAY_MS);
-                return false;
-            }
-
-            singleUseEnabled = true;
+    private boolean performClick(AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo cur = node;
+        for (int d = 0; d < 5 && cur != null; d++) {
+            if (cur.isClickable() && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+            cur = cur.getParent();
         }
-
-        return validitySelected && singleUseEnabled;
+        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     private boolean clickBottom(AccessibilityNodeInfo root, int index) {
         List<AccessibilityNodeInfo> clickables = new ArrayList<>();
         findClickable(root, clickables);
-        List<AccessibilityNodeInfo> bottomNodes = new ArrayList<>();
-        int screenHeight = getResources().getDisplayMetrics().heightPixels;
-        int minTop = (int) (screenHeight * 0.72f);
-        for (AccessibilityNodeInfo node : clickables) {
-            Rect r = getBounds(node);
-            if (r.top >= minTop) bottomNodes.add(node);
-        }
-        Collections.sort(bottomNodes, (a, b) -> {
-            Rect ar = getBounds(a);
-            Rect br = getBounds(b);
-            int byTop = Integer.compare(ar.top, br.top);
-            return byTop != 0 ? byTop : Integer.compare(ar.left, br.left);
+        List<AccessibilityNodeInfo> bottom = new ArrayList<>();
+        int minTop = (int) (getResources().getDisplayMetrics().heightPixels * 0.72f);
+        for (AccessibilityNodeInfo n : clickables) if (getBounds(n).top >= minTop) bottom.add(n);
+        Collections.sort(bottom, (a, b) -> {
+            int t = Integer.compare(getBounds(a).top, getBounds(b).top);
+            return t != 0 ? t : Integer.compare(getBounds(a).left, getBounds(b).left);
         });
-        return bottomNodes.size() > index && performClick(bottomNodes.get(index));
+        return bottom.size() > index && performClick(bottom.get(index));
     }
 
-    private void findFields(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> res) {
-        if (n == null) return;
-        if (n.isEditable() || safe(n.getClassName()).contains("EditText")) res.add(n);
-        for (int i = 0; i < n.getChildCount(); i++) findFields(n.getChild(i), res);
+    private List<AccessibilityNodeInfo> collectEditableFields(AccessibilityNodeInfo root) {
+        List<AccessibilityNodeInfo> fields = new ArrayList<>();
+        findFields(root, fields);
+        Collections.sort(fields, (a, b) -> Integer.compare(getBounds(a).top, getBounds(b).top));
+        return fields;
     }
 
-    private void findClickable(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> res) {
-        if (n == null) return;
-        if (n.isClickable()) res.add(n);
-        for (int i = 0; i < n.getChildCount(); i++) findClickable(n.getChild(i), res);
+    private AccessibilityNodeInfo findFieldByKeywords(AccessibilityNodeInfo root, String... kw) {
+        for (AccessibilityNodeInfo f : collectEditableFields(root)) {
+            if (matchesAny(f, kw)) return f;
+            AccessibilityNodeInfo p = f.getParent();
+            if (matchesAny(p, kw)) return f;
+        }
+        return null;
+    }
+
+    private AccessibilityNodeInfo findClickableNodeByKeywords(AccessibilityNodeInfo root, String... kw) {
+        if (root == null) return null;
+        if (matchesAny(root, kw) && (root.isClickable() || root.isFocusable())) return root;
+        for (int i = 0; i < root.getChildCount(); i++) {
+            AccessibilityNodeInfo f = findClickableNodeByKeywords(root.getChild(i), kw);
+            if (f != null) return f;
+        }
+        return null;
     }
 
     private AccessibilityNodeInfo findLabel(AccessibilityNodeInfo n, String l) {
@@ -308,162 +532,67 @@ public class ZasAccessibilityService extends AccessibilityService {
         return null;
     }
 
-    private List<AccessibilityNodeInfo> collectEditableFields(AccessibilityNodeInfo root) {
-        List<AccessibilityNodeInfo> fields = new ArrayList<>();
-        findFields(root, fields);
-        Collections.sort(fields, (a, b) -> Integer.compare(getBounds(a).top, getBounds(b).top));
-        return fields;
-    }
-
-    private AccessibilityNodeInfo findFieldByKeywords(AccessibilityNodeInfo root, String... keywords) {
-        for (AccessibilityNodeInfo field : collectEditableFields(root)) {
-            if (matchesAny(field, keywords)) return field;
-            AccessibilityNodeInfo parent = field.getParent();
-            if (matchesAny(parent, keywords)) return field;
-        }
-        return null;
-    }
-
-    private AccessibilityNodeInfo findClickableNodeByKeywords(AccessibilityNodeInfo root, String... keywords) {
-        if (root == null) return null;
-        if (matchesAny(root, keywords) && (root.isClickable() || root.isFocusable())) {
-            return root;
-        }
-        for (int i = 0; i < root.getChildCount(); i++) {
-            AccessibilityNodeInfo found = findClickableNodeByKeywords(root.getChild(i), keywords);
-            if (found != null) return found;
-        }
-        return null;
-    }
-
     private AccessibilityNodeInfo findSingleUseToggle(AccessibilityNodeInfo root) {
         AccessibilityNodeInfo labeled = findClickableNodeByKeywords(root,
                 "un solo uso", "solo uso", "pago unico", "pago único", "unico", "único");
         if (labeled != null) {
-            AccessibilityNodeInfo switchNode = labeled;
-            for (int i = 0; i < 4 && switchNode != null; i++) {
-                if (safe(switchNode.getClassName()).contains("Switch")
-                        || safe(switchNode.getClassName()).contains("CheckBox")
-                        || safe(switchNode.getClassName()).contains("Toggle")) {
-                    return switchNode;
-                }
-                switchNode = switchNode.getParent();
+            AccessibilityNodeInfo sw = labeled;
+            for (int i = 0; i < 4 && sw != null; i++) {
+                String cn = safe(sw.getClassName());
+                if (cn.contains("Switch") || cn.contains("CheckBox") || cn.contains("Toggle")) return sw;
+                sw = sw.getParent();
             }
             return labeled;
         }
-
-        AccessibilityNodeInfo switchNode = findClass(root, "android.widget.Switch");
-        if (switchNode != null) return switchNode;
-        switchNode = findClass(root, "androidx.appcompat.widget.SwitchCompat");
-        if (switchNode != null) return switchNode;
-        switchNode = findClass(root, "android.widget.CheckBox");
-        if (switchNode != null) return switchNode;
-        return findClass(root, "android.widget.ToggleButton");
-    }
-
-    private boolean clickByLabels(AccessibilityNodeInfo root, String... labels) {
-        for (String label : labels) {
-            AccessibilityNodeInfo node = findLabel(root, label);
-            if (node != null && performClick(node)) return true;
-        }
-        return false;
-    }
-
-    private boolean performClick(AccessibilityNodeInfo node) {
-        AccessibilityNodeInfo current = node;
-        for (int depth = 0; depth < 5 && current != null; depth++) {
-            if (current.isClickable() && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                return true;
-            }
-            current = current.getParent();
-        }
-        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-    }
-
-    private boolean setText(AccessibilityNodeInfo node, String value) {
-        if (node == null) return false;
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-        node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        sleep(180);
-        Bundle clear = new Bundle();
-        clear.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "");
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clear);
-        sleep(120);
-
-        Bundle args = new Bundle();
-        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
-        boolean ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
-        sleep(180);
-        CharSequence currentText = node.getText();
-        return ok || value.equals(safe(currentText));
-    }
-
-    private boolean primeAmountField(AccessibilityNodeInfo node) {
-        if (node == null) return false;
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-        boolean first = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        sleep(260);
-        boolean second = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        sleep(260);
-        return first || second;
-    }
-
-    private boolean matchesText(AccessibilityNodeInfo node, String keyword) {
-        return containsNormalized(safe(node != null ? node.getText() : null), keyword)
-                || containsNormalized(safe(node != null ? node.getContentDescription() : null), keyword)
-                || containsNormalized(getHint(node), keyword);
-    }
-
-    private boolean matchesAny(AccessibilityNodeInfo node, String... keywords) {
-        if (node == null) return false;
-        for (String keyword : keywords) {
-            if (matchesText(node, keyword)
-                    || containsNormalized(safe(node.getViewIdResourceName()), keyword)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean containsNormalized(String source, String needle) {
-        return normalize(source).contains(normalize(needle));
-    }
-
-    private String normalize(String value) {
-        String normalized = safe(value).toLowerCase()
-                .replace("á", "a")
-                .replace("é", "e")
-                .replace("í", "i")
-                .replace("ó", "o")
-                .replace("ú", "u")
-                .replace("ñ", "n");
-        return normalized.replaceAll("\\s+", " ").trim();
+        AccessibilityNodeInfo sw = findClass(root, "android.widget.Switch");
+        if (sw != null) return sw;
+        sw = findClass(root, "androidx.appcompat.widget.SwitchCompat");
+        if (sw != null) return sw;
+        sw = findClass(root, "android.widget.CheckBox");
+        return sw != null ? sw : findClass(root, "android.widget.ToggleButton");
     }
 
     private boolean isChecked(AccessibilityNodeInfo node) {
-        AccessibilityNodeInfo current = node;
-        for (int depth = 0; depth < 5 && current != null; depth++) {
-            if (current.isCheckable() || safe(current.getClassName()).contains("Switch")) {
-                return current.isChecked();
-            }
-            current = current.getParent();
+        AccessibilityNodeInfo cur = node;
+        for (int d = 0; d < 5 && cur != null; d++) {
+            if (cur.isCheckable() || safe(cur.getClassName()).contains("Switch")) return cur.isChecked();
+            cur = cur.getParent();
         }
         return false;
     }
 
-    private boolean shouldProcessEvent(int eventType) {
-        return eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                || eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-                || eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
-                || eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
-                || eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED;
+    private boolean matchesText(AccessibilityNodeInfo n, String kw) {
+        return containsNorm(safe(n != null ? n.getText() : null), kw)
+            || containsNorm(safe(n != null ? n.getContentDescription() : null), kw)
+            || containsNorm(getHint(n), kw);
     }
 
-    private void advance(State newState, long delayMs, String status) {
-        state = newState;
-        nextActionAtMs = System.currentTimeMillis() + delayMs;
-        scheduleRetry(delayMs);
-        showStatus(status);
+    private boolean matchesAny(AccessibilityNodeInfo n, String... kws) {
+        if (n == null) return false;
+        for (String kw : kws) {
+            if (matchesText(n, kw) || containsNorm(safe(n.getViewIdResourceName()), kw)) return true;
+        }
+        return false;
+    }
+
+    private boolean containsNorm(String src, String needle) { return norm(src).contains(norm(needle)); }
+    private String norm(String v) {
+        return safe(v).toLowerCase()
+                .replace("á","a").replace("é","e").replace("í","i")
+                .replace("ó","o").replace("ú","u").replace("ñ","n")
+                .replaceAll("\\s+", " ").trim();
+    }
+
+    private void findFields(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> res) {
+        if (n == null) return;
+        if (n.isEditable() || safe(n.getClassName()).contains("EditText")) res.add(n);
+        for (int i = 0; i < n.getChildCount(); i++) findFields(n.getChild(i), res);
+    }
+
+    private void findClickable(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> res) {
+        if (n == null) return;
+        if (n.isClickable()) res.add(n);
+        for (int i = 0; i < n.getChildCount(); i++) findClickable(n.getChild(i), res);
     }
 
     private void scheduleRetry(long delayMs) {
@@ -472,42 +601,26 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     private void retryProcess() {
-        if (state == State.IDLE) return;
+        if (state == State.IDLE || state == State.DECODING) return;
         process(getRootInActiveWindow());
     }
 
     private String sanitizeAmount(String raw) {
-        String normalized = safe(raw).trim().replace(',', '.');
-        return normalized.isEmpty() ? "5.00" : normalized;
+        String s = safe(raw).trim().replace(',', '.');
+        return s.isEmpty() ? "5.00" : s;
     }
 
     private String sanitizeReference(String raw) {
-        String normalized = safe(raw).trim();
-        return normalized.isEmpty() ? "PAGO_AUTO" : normalized;
+        String s = safe(raw).trim();
+        return s.isEmpty() ? "PAGO_AUTO" : s;
     }
 
-    private void dumpNode(AccessibilityNodeInfo node, int depth, StringBuilder sb, int visited, int limit) {
-        if (node == null || visited >= limit) return;
-        for (int i = 0; i < depth; i++) sb.append("  ");
-        Rect bounds = getBounds(node);
-        sb.append("- class=").append(safe(node.getClassName()))
-                .append(" text=").append(safe(node.getText()))
-                .append(" hint=").append(getHint(node))
-                .append(" desc=").append(safe(node.getContentDescription()))
-                .append(" id=").append(safe(node.getViewIdResourceName()))
-                .append(" editable=").append(node.isEditable())
-                .append(" clickable=").append(node.isClickable())
-                .append(" bounds=").append(bounds)
-                .append('\n');
-        for (int i = 0; i < node.getChildCount() && sb.length() < 16000; i++) {
-            dumpNode(node.getChild(i), depth + 1, sb, visited + 1, limit);
-        }
-    }
+    // ─── Status popup ────────────────────────────────────────────────────────
 
-    private void showStatus(String message) {
-        Log.i(TAG, message);
-        showToast(message);
-        showPopup(message);
+    private void showStatus(String msg) {
+        Log.i(TAG, msg);
+        showToast(msg);
+        showPopup(msg);
     }
 
     private void showPopup(String message) {
@@ -527,8 +640,7 @@ public class ZasAccessibilityService extends AccessibilityService {
                         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                                 | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                        android.graphics.PixelFormat.TRANSLUCENT
-                );
+                        android.graphics.PixelFormat.TRANSLUCENT);
                 params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
                 params.y = 72;
                 windowManager.addView(statusPopup, params);
@@ -543,23 +655,20 @@ public class ZasAccessibilityService extends AccessibilityService {
     private void hidePopup() {
         mainHandler.post(() -> {
             if (statusPopup != null) {
-                try {
-                    statusPopup.setVisibility(View.GONE);
-                    windowManager.removeView(statusPopup);
-                } catch (Exception ignored) {
-                }
+                try { windowManager.removeView(statusPopup); } catch (Exception ignored) {}
                 statusPopup = null;
             }
         });
     }
 
+    // ─── Tiny utils ──────────────────────────────────────────────────────────
+
     private Rect getBounds(AccessibilityNodeInfo n) { Rect r = new Rect(); n.getBoundsInScreen(r); return r; }
-    private String getHint(AccessibilityNodeInfo node) {
-        if (node == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return "";
-        return safe(node.getHintText());
+    private String getHint(AccessibilityNodeInfo n) {
+        if (n == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return "";
+        return safe(n.getHintText());
     }
     private String safe(CharSequence v) { return v == null ? "" : v.toString(); }
     private void sleep(long ms) { try { Thread.sleep(ms); } catch (Exception ignored) {} }
     private void showToast(String m) { mainHandler.post(() -> Toast.makeText(this, m, Toast.LENGTH_SHORT).show()); }
-    @Override public void onInterrupt() {}
 }

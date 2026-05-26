@@ -3,9 +3,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@drawable/bg_main_surface"
-    android:gravity="center"
-    android:orientation="vertical"
-    android:padding="24dp">
+    android:orientation="vertical">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -13,54 +11,139 @@
         android:background="@drawable/bg_panel_card"
         android:elevation="8dp"
         android:orientation="vertical"
-        android:padding="24dp">
+        android:padding="18dp">
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="ZAS QR Auto"
             android:textColor="#FFF7F3"
-            android:textSize="28sp"
+            android:textSize="22sp"
             android:textStyle="bold" />
 
         <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Verificando..."
+            android:textColor="#E7D7D0"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/etToken"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="12dp"
+            android:background="#33FFFFFF"
+            android:hint="Token qrgen_live_..."
+            android:inputType="textVisiblePassword"
+            android:padding="10dp"
+            android:textColor="#FFF7F3"
+            android:textColorHint="#88FFFFFF"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/etWorkerId"
+                android:layout_width="0dp"
+                android:layout_height="44dp"
+                android:layout_marginEnd="6dp"
+                android:layout_weight="1"
+                android:background="#33FFFFFF"
+                android:hint="Worker ID"
+                android:inputType="text"
+                android:padding="10dp"
+                android:textColor="#FFF7F3"
+                android:textColorHint="#88FFFFFF"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/etProvider"
+                android:layout_width="0dp"
+                android:layout_height="44dp"
+                android:layout_weight="1"
+                android:background="#33FFFFFF"
+                android:hint="Provider"
+                android:inputType="text"
+                android:padding="10dp"
+                android:textColor="#FFF7F3"
+                android:textColorHint="#88FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
-            android:text="Activa accesibilidad y lanza la automatización del formulario QR con seguimiento visual en pantalla."
-            android:textColor="#E7D7D0"
-            android:textSize="15sp" />
+            android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/btnSettings"
-            android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:layout_marginTop="28dp"
-            android:background="@drawable/bg_button_secondary"
-            android:elevation="2dp"
-            android:paddingStart="20dp"
-            android:paddingEnd="20dp"
-            android:text="Activar accesibilidad"
-            android:textAllCaps="false"
-            android:textColor="#FFF7F2"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            <Button
+                android:id="@+id/btnSettings"
+                android:layout_width="0dp"
+                android:layout_height="46dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_button_secondary"
+                android:text="Accesibilidad"
+                android:textAllCaps="false"
+                android:textColor="#FFF7F2"
+                android:textSize="13sp"
+                android:textStyle="bold" />
 
-        <Button
-            android:id="@+id/btnStart"
-            android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:layout_marginTop="14dp"
-            android:background="@drawable/bg_button_primary"
-            android:elevation="2dp"
-            android:paddingStart="20dp"
-            android:paddingEnd="20dp"
-            android:text="Iniciar automatización"
-            android:textAllCaps="false"
-            android:textColor="#6B0209"
-            android:textSize="16sp"
-            android:textStyle="bold" />
-
+            <Button
+                android:id="@+id/btnSave"
+                android:layout_width="0dp"
+                android:layout_height="46dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_button_primary"
+                android:text="Guardar config"
+                android:textAllCaps="false"
+                android:textColor="#6B0209"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
     </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:paddingTop="14dp"
+        android:paddingBottom="6dp"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Historial"
+            android:textColor="#FFF7F3"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvClear"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="4dp"
+            android:text="Limpiar"
+            android:textColor="#E7D7D0"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvHistory"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:clipToPadding="false"
+        android:padding="12dp" />
 
 </LinearLayout>
