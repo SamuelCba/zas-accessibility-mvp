@@ -16,13 +16,14 @@ class HistoryStorage {
         try {
             JSONArray arr = load(ctx);
             JSONObject o = new JSONObject();
-            o.put("id",      e.topupId);
-            o.put("amount",  e.amount);
-            o.put("ref",     e.reference);
-            o.put("concept", e.concept);
-            o.put("payload", e.qrPayload);
-            o.put("ts",      e.timestampMs);
-            o.put("ok",      e.submitted);
+            o.put("id",       e.topupId);
+            o.put("amount",   e.amount);
+            o.put("ref",      e.reference);
+            o.put("concept",  e.concept);
+            o.put("payload",  e.qrPayload);
+            o.put("ts",       e.timestampMs);
+            o.put("ok",       e.submitted);
+            o.put("verified", false);
             JSONArray updated = new JSONArray();
             updated.put(o);
             for (int i = 0; i < arr.length() && i < MAX - 1; i++) updated.put(arr.get(i));
@@ -37,11 +38,44 @@ class HistoryStorage {
     static boolean alreadyProcessed(Context ctx, String topupId) {
         try {
             JSONArray arr = load(ctx);
-            for (int i = 0; i < arr.length(); i++) {
+            for (int i = 0; i < arr.length(); i++)
                 if (topupId.equals(arr.getJSONObject(i).optString("id"))) return true;
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    /** Returns true if any submitted-but-not-verified entry exists. */
+    static boolean hasUnverified(Context ctx) {
+        try {
+            JSONArray arr = load(ctx);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                if (o.optBoolean("ok", false) && !o.optBoolean("verified", false)) return true;
             }
         } catch (Exception ignored) {}
         return false;
+    }
+
+    /** Marks all entries whose reference or concept matches as verified. */
+    static boolean markVerifiedByReference(Context ctx, String reportMotivo) {
+        boolean changed = false;
+        try {
+            JSONArray arr = load(ctx);
+            String needle = reportMotivo.trim().toLowerCase();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                if (o.optBoolean("verified", false)) continue;
+                String ref     = o.optString("ref", "").trim().toLowerCase();
+                String concept = o.optString("concept", "").trim().toLowerCase();
+                if (needle.equals(ref) || needle.equals(concept)
+                        || needle.contains(ref) || ref.contains(needle)) {
+                    o.put("verified", true);
+                    changed = true;
+                }
+            }
+            if (changed) BackendClient.prefs(ctx).edit().putString(KEY, arr.toString()).apply();
+        } catch (Exception ignored) {}
+        return changed;
     }
 
     static List<HistoryEntry> getAll(Context ctx) {
@@ -58,6 +92,7 @@ class HistoryStorage {
                 e.qrPayload   = o.optString("payload");
                 e.timestampMs = o.optLong("ts");
                 e.submitted   = o.optBoolean("ok");
+                e.verified    = o.optBoolean("verified");
                 list.add(e);
             }
         } catch (Exception ignored) {}
@@ -65,8 +100,7 @@ class HistoryStorage {
     }
 
     private static JSONArray load(Context ctx) {
-        try {
-            return new JSONArray(BackendClient.prefs(ctx).getString(KEY, "[]"));
-        } catch (Exception e) { return new JSONArray(); }
+        try { return new JSONArray(BackendClient.prefs(ctx).getString(KEY, "[]")); }
+        catch (Exception e) { return new JSONArray(); }
     }
 }

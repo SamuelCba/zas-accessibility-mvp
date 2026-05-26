@@ -8,4 +8,5 @@ class HistoryEntry {
     String  qrPayload;
     long    timestampMs;
     boolean submitted;
+    boolean verified;
 }

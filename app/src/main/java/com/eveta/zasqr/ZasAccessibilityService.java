@@ -39,20 +39,23 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     private static final String TAG         = "ZasQRG";
     private static final String ZAS_PACKAGE = "bec.vdb.direct";
-    private static final long   ACTION_DELAY_MS  = 900L;
+    private static final long   ACTION_DELAY_MS  = 500L;
     private static final long   POLL_INTERVAL_MS = 3000L;
-    static final String         ACTION_HISTORY_UPDATED = "com.eveta.zasqr.HISTORY_UPDATED";
+    private static final long   VERIFY_COOLDOWN_MS = 20000L;
+    static  final String        ACTION_HISTORY_UPDATED = "com.eveta.zasqr.HISTORY_UPDATED";
 
     private static ZasAccessibilityService instance;
 
     private enum State {
-        IDLE, EDITING, FILLING, CONFIGURING, GENERATING,
-        WAITING_FOR_SAVE, DECODING, SAVING, RESETTING
+        IDLE,
+        EDITING, FILLING, CONFIGURING, GENERATING, WAITING_FOR_SAVE, DECODING,
+        VERIFY_NAV, VERIFY_SELECT, VERIFY_READ
     }
 
     private State   state = State.IDLE;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    // QR generation fields
     private String  amt = "5.00";
     private String  ref = "PAGO_AUTO";
     private boolean validitySelected;
@@ -60,10 +63,11 @@ public class ZasAccessibilityService extends AccessibilityService {
     private boolean amountFieldPrepared;
     private boolean keyboardDismissed;
     private long    nextActionAtMs;
-
+    private long    preGenMaxQrId = -1L;
     private BackendClient.TopupData currentTopup;
-    // Max MediaStore _ID of QR images seen before we started generating
-    private long preGenMaxQrId = -1L;
+
+    // Verification
+    private long lastVerifyAtMs = 0L;
 
     private WindowManager windowManager;
     private TextView      statusPopup;
@@ -94,7 +98,7 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     @Override public void onInterrupt() {}
 
-    // ─── Backend polling ─────────────────────────────────────────────────────
+    // ─── Polling ─────────────────────────────────────────────────────────────
 
     private void schedulePoll(long delayMs) {
         mainHandler.removeCallbacks(pollRunnable);
@@ -103,28 +107,37 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     private void doPoll() {
         if (state != State.IDLE) { schedulePoll(POLL_INTERVAL_MS); return; }
-        String token = BackendClient.token(this);
-        if (token.isEmpty()) { schedulePoll(POLL_INTERVAL_MS); return; }
+        if (BackendClient.token(this).isEmpty()) { schedulePoll(POLL_INTERVAL_MS); return; }
 
         new Thread(() -> {
             try {
                 BackendClient.TopupData topup = BackendClient.getNextTopup(this);
                 mainHandler.post(() -> {
-                    if (topup == null || state != State.IDLE) {
-                        schedulePoll(POLL_INTERVAL_MS);
+                    if (state != State.IDLE) { schedulePoll(POLL_INTERVAL_MS); return; }
+
+                    if (topup != null) {
+                        if (HistoryStorage.alreadyProcessed(this, topup.id)) {
+                            Log.w(TAG, "Topup " + topup.id + " ya procesado");
+                            schedulePoll(POLL_INTERVAL_MS);
+                            return;
+                        }
+                        currentTopup = topup;
+                        startAutoFlow(topup.amount, topup.reference);
                         return;
                     }
-                    // Skip if already processed (dedup)
-                    if (HistoryStorage.alreadyProcessed(this, topup.id)) {
-                        Log.w(TAG, "Topup " + topup.id + " ya procesado, saltando");
+
+                    // No topups — check if we should verify
+                    long now = System.currentTimeMillis();
+                    if (HistoryStorage.hasUnverified(this)
+                            && (now - lastVerifyAtMs) > VERIFY_COOLDOWN_MS) {
+                        lastVerifyAtMs = now;
+                        startVerification();
+                    } else {
                         schedulePoll(POLL_INTERVAL_MS);
-                        return;
                     }
-                    currentTopup = topup;
-                    startAutoFlow(topup.amount, topup.reference);
                 });
             } catch (Exception e) {
-                Log.w(TAG, "poll error: " + e.getMessage());
+                Log.w(TAG, "poll: " + e.getMessage());
                 mainHandler.postDelayed(pollRunnable, POLL_INTERVAL_MS);
             }
         }).start();
@@ -137,12 +150,25 @@ public class ZasAccessibilityService extends AccessibilityService {
         resetFlowState(amt, ref);
         state = State.EDITING;
         showStatus("Iniciando: " + amt + " / " + ref);
+        launchZas(false);
+    }
+
+    private void startVerification() {
+        state = State.VERIFY_NAV;
+        showStatus("Verificando pagos...");
+        launchZas(true);
+        nextActionAtMs = System.currentTimeMillis() + 1200L;
+        scheduleRetry(1200L);
+    }
+
+    private void launchZas(boolean singleTop) {
         Intent i = getPackageManager().getLaunchIntentForPackage(ZAS_PACKAGE);
         if (i == null) {
             i = new Intent(Intent.ACTION_MAIN);
             i.setClassName(ZAS_PACKAGE, ZAS_PACKAGE + ".MainActivity");
         }
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (singleTop) i.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         startActivity(i);
     }
 
@@ -151,8 +177,16 @@ public class ZasAccessibilityService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         String pkg = event.getPackageName() != null ? event.getPackageName().toString() : "";
-        if (pkg.equals(ZAS_PACKAGE) && state != State.IDLE && shouldProcessEvent(event.getEventType())) {
-            process(getRootInActiveWindow());
+        if (!pkg.equals(ZAS_PACKAGE)) return;
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+
+        // Always handle payment popup regardless of state
+        if (handlePaymentPopup(root)) return;
+
+        if (state != State.IDLE && shouldProcessEvent(event.getEventType())) {
+            process(root);
         }
     }
 
@@ -164,6 +198,20 @@ public class ZasAccessibilityService extends AccessibilityService {
             || t == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED;
     }
 
+    // ─── Payment popup handler ───────────────────────────────────────────────
+
+    private boolean handlePaymentPopup(AccessibilityNodeInfo root) {
+        if (findLabel(root, "Pago QR recibido") == null) return false;
+        showStatus("Pago recibido — continuando...");
+        if (clickByLabels(root, "Cerrar")) {
+            // Resume current flow after a small pause
+            if (state != State.IDLE && state != State.DECODING) {
+                scheduleRetry(ACTION_DELAY_MS * 2);
+            }
+        }
+        return true;
+    }
+
     // ─── State machine ───────────────────────────────────────────────────────
 
     private void process(AccessibilityNodeInfo root) {
@@ -171,6 +219,7 @@ public class ZasAccessibilityService extends AccessibilityService {
         if (System.currentTimeMillis() < nextActionAtMs) return;
 
         switch (state) {
+            // — QR generation —
             case EDITING:
                 if (openEditor(root)) advance(State.FILLING, ACTION_DELAY_MS, "Abriendo formulario");
                 break;
@@ -181,27 +230,28 @@ public class ZasAccessibilityService extends AccessibilityService {
                 if (configureForm(root)) advance(State.GENERATING, ACTION_DELAY_MS, "Config OK");
                 break;
             case GENERATING:
-                // Snapshot max QR _ID right before clicking Generar
                 preGenMaxQrId = getMaxQrId();
-                if (clickByLabels(root, "Generar")) {
-                    advance(State.WAITING_FOR_SAVE, 1500L, "Generando QR...");
-                }
+                if (clickByLabels(root, "Generar")) advance(State.WAITING_FOR_SAVE, 1200L, "Generando QR...");
                 break;
             case WAITING_FOR_SAVE:
-                if (saveResult(root)) advance(State.DECODING, ACTION_DELAY_MS, "Guardando imagen...");
+                if (saveResult(root)) advance(State.DECODING, ACTION_DELAY_MS, "Imagen guardada");
                 break;
             case DECODING:
-                // background thread handles this
-                break;
-            case SAVING:
-                if (openEditor(root)) advance(State.RESETTING, ACTION_DELAY_MS, "Limpiando...");
-                break;
-            case RESETTING:
-                if (clickByLabels(root, "Limpiar")) {
-                    showStatus("Ciclo completo");
-                    state = State.IDLE;
-                    schedulePoll(POLL_INTERVAL_MS);
+                break; // background thread
+
+            // — Verification —
+            case VERIFY_NAV:
+                if (clickByLabels(root, "Reportes")) {
+                    advance(State.VERIFY_SELECT, 700L, "Abriendo reportes");
                 }
+                break;
+            case VERIFY_SELECT:
+                if (clickByLabels(root, "por Cobro QR", "Cobro QR")) {
+                    advance(State.VERIFY_READ, 900L, "Leyendo reporte");
+                }
+                break;
+            case VERIFY_READ:
+                doVerifyRead(root);
                 break;
         }
     }
@@ -217,63 +267,101 @@ public class ZasAccessibilityService extends AccessibilityService {
         }
     }
 
+    // ─── Verification read ───────────────────────────────────────────────────
+
+    private void doVerifyRead(AccessibilityNodeInfo root) {
+        List<String> texts = new ArrayList<>();
+        collectTexts(root, texts);
+
+        boolean anyChanged = false;
+        String pendingMotivo = null;
+
+        for (String text : texts) {
+            String t = text.trim();
+            String tl = t.toLowerCase();
+
+            if (tl.startsWith("motivo ")) {
+                pendingMotivo = t.substring(7).trim();
+            } else if (pendingMotivo != null && tl.startsWith("pagos recibidos:")) {
+                try {
+                    int count = Integer.parseInt(tl.replace("pagos recibidos:", "").trim());
+                    if (count > 0) {
+                        boolean changed = HistoryStorage.markVerifiedByReference(this, pendingMotivo);
+                        if (changed) anyChanged = true;
+                        Log.i(TAG, "Verificado: " + pendingMotivo + " pagos=" + count);
+                    }
+                } catch (NumberFormatException ignored) {}
+                pendingMotivo = null;
+            }
+        }
+
+        if (anyChanged) sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
+
+        performGlobalAction(GLOBAL_ACTION_BACK);
+        showStatus(anyChanged ? "Pagos verificados" : "Sin pagos nuevos");
+        state = State.IDLE;
+        schedulePoll(POLL_INTERVAL_MS);
+    }
+
+    private void collectTexts(AccessibilityNodeInfo n, List<String> out) {
+        if (n == null) return;
+        CharSequence t = n.getText();
+        if (t != null && t.length() > 0) out.add(t.toString());
+        for (int i = 0; i < n.getChildCount(); i++) collectTexts(n.getChild(i), out);
+    }
+
     // ─── Decode & submit ─────────────────────────────────────────────────────
 
     private void startDecodeAndSubmit() {
         final long snapshotId = preGenMaxQrId;
         new Thread(() -> {
-            // Wait 3s for gallery to index the saved image
-            sleep(3000);
+            sleep(2500);
 
             String payload = null;
             long deadline = System.currentTimeMillis() + 15000;
             while (System.currentTimeMillis() < deadline) {
                 payload = findAndDecodeQrAfter(snapshotId);
                 if (payload != null) break;
-                Log.d(TAG, "QR no encontrado aun, reintentando...");
                 sleep(1500);
             }
 
             final String qrPayload  = payload != null ? payload : "";
             final boolean hasPayload = !qrPayload.isEmpty();
-
-            Log.i(TAG, hasPayload ? "QR decodificado: " + qrPayload : "No se decodifico QR");
+            Log.i(TAG, hasPayload ? "QR: " + qrPayload : "Sin QR decodificado");
 
             boolean submitted = false;
             if (hasPayload && currentTopup != null) {
                 try {
                     submitted = BackendClient.submitQrPayload(this, currentTopup.id, qrPayload);
-                    Log.i(TAG, "Submit: " + submitted);
-                } catch (Exception e) {
-                    Log.e(TAG, "Submit error: " + e.getMessage());
-                }
+                } catch (Exception e) { Log.e(TAG, "Submit: " + e.getMessage()); }
             }
 
             if (currentTopup != null) {
-                HistoryEntry entry = new HistoryEntry();
-                entry.topupId     = currentTopup.id;
-                entry.amount      = currentTopup.amount;
-                entry.reference   = currentTopup.reference;
-                entry.concept     = currentTopup.concept;
-                entry.qrPayload   = qrPayload;
-                entry.timestampMs = System.currentTimeMillis();
-                entry.submitted   = submitted;
+                HistoryEntry entry  = new HistoryEntry();
+                entry.topupId      = currentTopup.id;
+                entry.amount       = currentTopup.amount;
+                entry.reference    = currentTopup.reference;
+                entry.concept      = currentTopup.concept;
+                entry.qrPayload    = qrPayload;
+                entry.timestampMs  = System.currentTimeMillis();
+                entry.submitted    = submitted;
+                entry.verified     = false;
                 HistoryStorage.add(this, entry);
                 sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
             }
 
             final boolean ok = submitted;
             mainHandler.post(() -> {
-                showStatus(ok ? "Enviado OK" : (hasPayload ? "Decode OK, submit fallo" : "Sin QR decodificado"));
+                showStatus(ok ? "Enviado OK" : (hasPayload ? "Decode OK, submit fallido" : "Sin QR"));
                 currentTopup = null;
-                advance(State.SAVING, ACTION_DELAY_MS, "Volviendo al formulario");
+                state = State.IDLE;
+                schedulePoll(POLL_INTERVAL_MS);
             });
         }).start();
     }
 
     // ─── MediaStore + ZXing ──────────────────────────────────────────────────
 
-    /** Returns the highest _ID among QR* images currently in the gallery, or -1 if none. */
     private long getMaxQrId() {
         String[] proj = {MediaStore.Images.Media._ID};
         String   sel  = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'";
@@ -285,7 +373,6 @@ public class ZasAccessibilityService extends AccessibilityService {
         return -1L;
     }
 
-    /** Finds the first QR* image with _ID > snapshotId and decodes it. */
     private String findAndDecodeQrAfter(long snapshotId) {
         String[] proj = {MediaStore.Images.Media._ID};
         String   sel  = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'"
@@ -294,10 +381,8 @@ public class ZasAccessibilityService extends AccessibilityService {
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, sel, null,
                 MediaStore.Images.Media._ID + " DESC")) {
             if (c != null && c.moveToFirst()) {
-                long id  = c.getLong(0);
-                Uri  uri = ContentUris.withAppendedId(
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
-                Log.d(TAG, "QR image found _ID=" + id + " uri=" + uri);
+                Uri uri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0));
                 return decodeQrUri(uri);
             }
         } catch (Exception e) { Log.w(TAG, "findQr: " + e.getMessage()); }
@@ -310,17 +395,13 @@ public class ZasAccessibilityService extends AccessibilityService {
             Bitmap bmp = BitmapFactory.decodeStream(is);
             if (bmp == null) return null;
             int w = bmp.getWidth(), h = bmp.getHeight();
-            int[] pixels = new int[w * h];
-            bmp.getPixels(pixels, 0, w, 0, 0, w, h);
+            int[] px = new int[w * h];
+            bmp.getPixels(px, 0, w, 0, 0, w, h);
             bmp.recycle();
-            BinaryBitmap bin = new BinaryBitmap(
-                    new HybridBinarizer(new RGBLuminanceSource(w, h, pixels)));
-            Result result = new QRCodeReader().decode(bin);
-            return result.getText();
-        } catch (Exception e) {
-            Log.w(TAG, "ZXing: " + e.getMessage());
-            return null;
-        }
+            Result r = new QRCodeReader().decode(
+                    new BinaryBitmap(new HybridBinarizer(new RGBLuminanceSource(w, h, px))));
+            return r.getText();
+        } catch (Exception e) { Log.w(TAG, "ZXing: " + e.getMessage()); return null; }
     }
 
     // ─── Form interaction ────────────────────────────────────────────────────
@@ -336,32 +417,26 @@ public class ZasAccessibilityService extends AccessibilityService {
         if (referenceField == null && fields.size() > 1)
             referenceField = fields.get(amountField == fields.get(0) ? 1 : 0);
 
-        if (amountField == null || referenceField == null) {
-            showStatus("Campos no detectados");
-            return false;
-        }
+        if (amountField == null || referenceField == null) { showStatus("Campos no detectados"); return false; }
 
         if (!amountFieldPrepared) {
             amountFieldPrepared = primeAmountField(amountField);
             if (!amountFieldPrepared) {
-                showStatus("No pude preparar monto");
+                showStatus("Preparando campo monto");
                 nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
                 scheduleRetry(ACTION_DELAY_MS);
                 return false;
             }
-            showStatus("Campo monto listo");
             nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
             scheduleRetry(ACTION_DELAY_MS);
             return false;
         }
 
         if (!setText(amountField, amt)) {
-            showStatus("Reintentando monto");
             nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
             return false;
         }
-
-        sleep(250);
+        sleep(150);
         boolean refOk = setText(referenceField, ref);
 
         if (refOk) {
@@ -369,7 +444,6 @@ public class ZasAccessibilityService extends AccessibilityService {
             if (!keyboardDismissed) {
                 performGlobalAction(GLOBAL_ACTION_BACK);
                 keyboardDismissed = true;
-                showStatus("Cerrando teclado");
                 nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
                 scheduleRetry(ACTION_DELAY_MS);
                 return false;
@@ -385,26 +459,22 @@ public class ZasAccessibilityService extends AccessibilityService {
                 validitySelected = true;
                 keyboardDismissed = true;
                 nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
-                showStatus("Validez: 1 dia");
                 scheduleRetry(ACTION_DELAY_MS);
                 return false;
             }
             AccessibilityNodeInfo vc = findClickableNodeByKeywords(root, "validez", "vigencia", "vencimiento");
             if (vc != null && performClick(vc)) {
                 nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
-                showStatus("Abriendo selector validez");
                 scheduleRetry(ACTION_DELAY_MS);
             }
             return false;
         }
-
         if (!singleUseEnabled) {
             AccessibilityNodeInfo toggle = findSingleUseToggle(root);
             if (toggle == null) return false;
             if (!isChecked(toggle)) {
                 if (!performClick(toggle)) return false;
                 nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
-                showStatus("Activando un solo uso");
                 scheduleRetry(ACTION_DELAY_MS);
                 return false;
             }
@@ -426,22 +496,22 @@ public class ZasAccessibilityService extends AccessibilityService {
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
     private void resetFlowState(String newAmt, String newRef) {
-        this.amt               = sanitizeAmount(newAmt);
-        this.ref               = sanitizeReference(newRef);
-        this.validitySelected  = false;
-        this.singleUseEnabled  = false;
-        this.amountFieldPrepared = false;
-        this.keyboardDismissed = false;
-        this.nextActionAtMs    = 0L;
-        this.preGenMaxQrId     = -1L;
+        amt = sanitizeAmount(newAmt);
+        ref = sanitizeReference(newRef);
+        validitySelected  = false;
+        singleUseEnabled  = false;
+        amountFieldPrepared = false;
+        keyboardDismissed = false;
+        nextActionAtMs    = 0L;
+        preGenMaxQrId     = -1L;
         mainHandler.removeCallbacks(retryRunnable);
     }
 
     private boolean primeAmountField(AccessibilityNodeInfo node) {
         if (node == null) return false;
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-        boolean f = node.performAction(AccessibilityNodeInfo.ACTION_CLICK); sleep(260);
-        boolean s = node.performAction(AccessibilityNodeInfo.ACTION_CLICK); sleep(260);
+        boolean f = node.performAction(AccessibilityNodeInfo.ACTION_CLICK); sleep(150);
+        boolean s = node.performAction(AccessibilityNodeInfo.ACTION_CLICK); sleep(150);
         return f || s;
     }
 
@@ -449,15 +519,15 @@ public class ZasAccessibilityService extends AccessibilityService {
         if (node == null) return false;
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
         node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        sleep(180);
+        sleep(100);
         Bundle clear = new Bundle();
         clear.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "");
         node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clear);
-        sleep(120);
+        sleep(80);
         Bundle args = new Bundle();
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
         boolean ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
-        sleep(180);
+        sleep(100);
         return ok || value.equals(safe(node.getText()));
     }
 
@@ -501,8 +571,7 @@ public class ZasAccessibilityService extends AccessibilityService {
     private AccessibilityNodeInfo findFieldByKeywords(AccessibilityNodeInfo root, String... kw) {
         for (AccessibilityNodeInfo f : collectEditableFields(root)) {
             if (matchesAny(f, kw)) return f;
-            AccessibilityNodeInfo p = f.getParent();
-            if (matchesAny(p, kw)) return f;
+            if (matchesAny(f.getParent(), kw)) return f;
         }
         return null;
     }
@@ -538,16 +607,16 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     private AccessibilityNodeInfo findSingleUseToggle(AccessibilityNodeInfo root) {
-        AccessibilityNodeInfo labeled = findClickableNodeByKeywords(root,
+        AccessibilityNodeInfo l = findClickableNodeByKeywords(root,
                 "un solo uso", "solo uso", "pago unico", "pago único", "unico", "único");
-        if (labeled != null) {
-            AccessibilityNodeInfo sw = labeled;
+        if (l != null) {
+            AccessibilityNodeInfo sw = l;
             for (int i = 0; i < 4 && sw != null; i++) {
                 String cn = safe(sw.getClassName());
                 if (cn.contains("Switch") || cn.contains("CheckBox") || cn.contains("Toggle")) return sw;
                 sw = sw.getParent();
             }
-            return labeled;
+            return l;
         }
         AccessibilityNodeInfo sw = findClass(root, "android.widget.Switch");
         if (sw != null) return sw;
@@ -574,8 +643,7 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     private boolean matchesAny(AccessibilityNodeInfo n, String... kws) {
         if (n == null) return false;
-        for (String kw : kws)
-            if (matchesText(n, kw) || cn(safe(n.getViewIdResourceName()), kw)) return true;
+        for (String kw : kws) if (matchesText(n, kw) || cn(safe(n.getViewIdResourceName()), kw)) return true;
         return false;
     }
 
@@ -601,7 +669,7 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     private void scheduleRetry(long delayMs) {
         mainHandler.removeCallbacks(retryRunnable);
-        mainHandler.postDelayed(retryRunnable, delayMs + 180L);
+        mainHandler.postDelayed(retryRunnable, delayMs + 150L);
     }
 
     private void retryProcess() {
@@ -609,15 +677,8 @@ public class ZasAccessibilityService extends AccessibilityService {
         process(getRootInActiveWindow());
     }
 
-    private String sanitizeAmount(String raw) {
-        String s = safe(raw).trim().replace(',', '.');
-        return s.isEmpty() ? "5.00" : s;
-    }
-
-    private String sanitizeReference(String raw) {
-        String s = safe(raw).trim();
-        return s.isEmpty() ? "PAGO_AUTO" : s;
-    }
+    private String sanitizeAmount(String r) { String s = safe(r).trim().replace(',','.'); return s.isEmpty() ? "5.00" : s; }
+    private String sanitizeReference(String r) { String s = safe(r).trim(); return s.isEmpty() ? "PAGO_AUTO" : s; }
 
     // ─── Status popup ─────────────────────────────────────────────────────────
 
@@ -637,7 +698,7 @@ public class ZasAccessibilityService extends AccessibilityService {
                 statusPopup.setPadding(36, 20, 36, 20);
                 statusPopup.setBackgroundColor(0xE8111111);
                 statusPopup.setGravity(Gravity.CENTER);
-                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams p = new WindowManager.LayoutParams(
                         WindowManager.LayoutParams.WRAP_CONTENT,
                         WindowManager.LayoutParams.WRAP_CONTENT,
                         WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -645,9 +706,9 @@ public class ZasAccessibilityService extends AccessibilityService {
                                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                                 | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                         android.graphics.PixelFormat.TRANSLUCENT);
-                params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
-                params.y = 72;
-                windowManager.addView(statusPopup, params);
+                p.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                p.y = 72;
+                windowManager.addView(statusPopup, p);
             }
             statusPopup.setVisibility(View.VISIBLE);
             statusPopup.setText(message);
@@ -664,8 +725,6 @@ public class ZasAccessibilityService extends AccessibilityService {
             }
         });
     }
-
-    // ─── Micro utils ──────────────────────────────────────────────────────────
 
     private Rect   getBounds(AccessibilityNodeInfo n) { Rect r = new Rect(); n.getBoundsInScreen(r); return r; }
     private String getHint(AccessibilityNodeInfo n) {

@@ -40,8 +40,17 @@ public class HistoryAdapter extends RecyclerView.Adapter<HistoryAdapter.VH> {
         h.tvRef.setText(e.concept.isEmpty() ? e.reference : e.concept + "  |  " + e.reference);
         h.tvPayload.setText(e.qrPayload.isEmpty() ? "(sin payload)" : e.qrPayload);
         h.tvTime.setText(FMT.format(new Date(e.timestampMs)));
-        h.tvStatus.setText(e.submitted ? "OK" : "Error");
-        h.tvStatus.setTextColor(e.submitted ? 0xFF2E7D32 : 0xFFC62828);
+
+        if (!e.submitted) {
+            h.tvStatus.setText("Error");
+            h.tvStatus.setTextColor(0xFFC62828);
+        } else if (!e.verified) {
+            h.tvStatus.setText("Pendiente");
+            h.tvStatus.setTextColor(0xFFE65100);
+        } else {
+            h.tvStatus.setText("Pagado");
+            h.tvStatus.setTextColor(0xFF2E7D32);
+        }
     }
 
     @Override public int getItemCount() { return items.size(); }
