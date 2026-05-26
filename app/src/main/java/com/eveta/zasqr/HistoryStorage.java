@@ -21,6 +21,7 @@ class HistoryStorage {
             o.put("ref",      e.reference);
             o.put("concept",  e.concept);
             o.put("payload",  e.qrPayload);
+            o.put("reqAt",    e.requestAtMs);
             o.put("ts",       e.timestampMs);
             o.put("ok",       e.submitted);
             o.put("verified", false);
@@ -89,10 +90,11 @@ class HistoryStorage {
                 e.amount      = o.optString("amount");
                 e.reference   = o.optString("ref");
                 e.concept     = o.optString("concept");
-                e.qrPayload   = o.optString("payload");
-                e.timestampMs = o.optLong("ts");
-                e.submitted   = o.optBoolean("ok");
-                e.verified    = o.optBoolean("verified");
+                e.qrPayload    = o.optString("payload");
+                e.requestAtMs  = o.optLong("reqAt");
+                e.timestampMs  = o.optLong("ts");
+                e.submitted    = o.optBoolean("ok");
+                e.verified     = o.optBoolean("verified");
                 list.add(e);
             }
         } catch (Exception ignored) {}

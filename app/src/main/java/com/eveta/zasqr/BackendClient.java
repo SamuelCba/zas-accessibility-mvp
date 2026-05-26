@@ -72,5 +72,6 @@ class BackendClient {
 
     static class TopupData {
         String id, amount, reference, concept;
+        long   requestAtMs;
     }
 }

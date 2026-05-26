@@ -36,14 +36,21 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ZasAccessibilityService extends AccessibilityService {
 
     private static final String TAG         = "ZasQRG";
     private static final String ZAS_PACKAGE = "bec.vdb.direct";
-    private static final long   ACTION_DELAY_MS  = 500L;
-    private static final long   POLL_INTERVAL_MS = 3000L;
+    private static final long   ACTION_DELAY_MS    = 500L;
+    private static final long   POLL_INTERVAL_MS   = 3000L;
     private static final long   VERIFY_COOLDOWN_MS = 20000L;
+    private static final long   EXPIRED_MS         = 10 * 60 * 1000L; // 10 min
+
+    // Regex to extract report data — robust against node structure variations
+    private static final Pattern PAT_CODE  = Pattern.compile("[A-Z]{2,8}\\d{4,}");
+    private static final Pattern PAT_PAGOS = Pattern.compile("(?i)pagos recibidos[^\\d]*(\\d+)");
     static  final String        ACTION_HISTORY_UPDATED = "com.eveta.zasqr.HISTORY_UPDATED";
 
     private static ZasAccessibilityService instance;
@@ -126,6 +133,7 @@ public class ZasAccessibilityService extends AccessibilityService {
                             schedulePoll(POLL_INTERVAL_MS);
                             return;
                         }
+                        topup.requestAtMs = System.currentTimeMillis();
                         currentTopup = topup;
                         startAutoFlow(topup.amount, topup.reference);
                         return;
@@ -353,50 +361,31 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * Parses visible report cards → map motivo→pagosRecibidos.
-     * Each card has lines: "Bs5.00", "Motivo EVTAXXXXXXXX", "Pagos recibidos: N", ...
-     * Handles both separate nodes AND a single multi-line node (split by \n).
+     * Parses visible report cards using regex — robust against any node/line structure.
+     * Finds reference codes ([A-Z]{2,8}\d{4,}) then the next "Pagos recibidos: N" nearby.
      */
     private void collectReportEntries(AccessibilityNodeInfo root, Map<String, Integer> out) {
-        // collectLines splits multi-line nodes so "Bs5.00\nMotivo EVT..." is handled correctly
         List<String> lines = new ArrayList<>();
         collectLines(root, lines);
 
-        String  pendingMotivo = null;
-        boolean expectValue   = false;
-
-        for (String raw : lines) {
-            String t  = raw.trim();
-            String tl = t.toLowerCase();
-            if (t.isEmpty()) continue;
-
-            if (tl.equals("motivo")) {
-                // two-node layout: next line is the reference code
-                expectValue   = true;
-                pendingMotivo = null;
+        String lastCode = null;
+        for (String line : lines) {
+            // Try to find a reference code in this line
+            Matcher mc = PAT_CODE.matcher(line);
+            if (mc.find()) {
+                lastCode = mc.group();
                 continue;
             }
-            if (expectValue) {
-                expectValue = false;
-                if (!tl.startsWith("bs") && !tl.startsWith("pagos")
-                        && !tl.startsWith("total") && !tl.startsWith("generado")
-                        && !tl.startsWith("reporte")) {
-                    pendingMotivo = t;
-                    continue;
+            // Try to find "Pagos recibidos: N" — associate with last found code
+            if (lastCode != null) {
+                Matcher mp = PAT_PAGOS.matcher(line);
+                if (mp.find()) {
+                    try {
+                        int count = Integer.parseInt(mp.group(1));
+                        out.putIfAbsent(lastCode, count);
+                    } catch (NumberFormatException ignored) {}
+                    lastCode = null;
                 }
-            }
-            if (tl.startsWith("motivo ") && t.length() > 7) {
-                // single-node layout: "Motivo EVTAXXXXXXXX"
-                pendingMotivo = t.substring(7).trim();
-                continue;
-            }
-            if (pendingMotivo != null && tl.startsWith("pagos recibidos")) {
-                String numStr = tl.replaceAll("[^0-9]", "");
-                try {
-                    int count = numStr.isEmpty() ? 0 : Integer.parseInt(numStr);
-                    out.putIfAbsent(pendingMotivo, count);
-                } catch (NumberFormatException ignored) {}
-                pendingMotivo = null;
             }
         }
     }
@@ -459,14 +448,15 @@ public class ZasAccessibilityService extends AccessibilityService {
 
             if (currentTopup != null) {
                 HistoryEntry entry  = new HistoryEntry();
-                entry.topupId      = currentTopup.id;
-                entry.amount       = currentTopup.amount;
-                entry.reference    = currentTopup.reference;
-                entry.concept      = currentTopup.concept;
-                entry.qrPayload    = qrPayload;
-                entry.timestampMs  = System.currentTimeMillis();
-                entry.submitted    = submitted;
-                entry.verified     = false;
+                entry.topupId     = currentTopup.id;
+                entry.amount      = currentTopup.amount;
+                entry.reference   = currentTopup.reference;
+                entry.concept     = currentTopup.concept;
+                entry.qrPayload   = qrPayload;
+                entry.requestAtMs = currentTopup.requestAtMs;
+                entry.timestampMs = System.currentTimeMillis();
+                entry.submitted   = submitted;
+                entry.verified    = false;
                 HistoryStorage.add(this, entry);
                 sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
             }
