@@ -33,7 +33,9 @@ import com.google.zxing.qrcode.QRCodeReader;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class ZasAccessibilityService extends AccessibilityService {
 
@@ -67,9 +69,7 @@ public class ZasAccessibilityService extends AccessibilityService {
     private BackendClient.TopupData currentTopup;
 
     // Verification
-    private long lastVerifyAtMs   = 0L;
-    private int  verifyReadTries  = 0;
-    private static final int VERIFY_READ_MAX_TRIES = 8; // 8 × 1.5s = 12s max
+    private long lastVerifyAtMs = 0L;
 
     private WindowManager windowManager;
     private TextView      statusPopup;
@@ -156,7 +156,6 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     private void startVerification() {
-        verifyReadTries = 0;
         state = State.VERIFY_NAV;
         showStatus("Verificando pagos...");
         launchZas(true);
@@ -254,8 +253,7 @@ public class ZasAccessibilityService extends AccessibilityService {
                 }
                 break;
             case VERIFY_READ:
-                doVerifyRead(root);
-                break;
+                break; // async thread handles it
         }
     }
 
@@ -265,87 +263,145 @@ public class ZasAccessibilityService extends AccessibilityService {
         showStatus(status);
         if (newState == State.DECODING) {
             startDecodeAndSubmit();
+        } else if (newState == State.VERIFY_READ) {
+            mainHandler.postDelayed(this::startVerifyReadAsync, delayMs);
         } else {
             scheduleRetry(delayMs);
         }
     }
 
-    // ─── Verification read ───────────────────────────────────────────────────
+    // ─── Verification read (async) ───────────────────────────────────────────
 
-    private void doVerifyRead(AccessibilityNodeInfo root) {
-        // 1. Confirm we're on the right screen
-        if (findLabel(root, "Reporte por Cobros QR") == null) {
-            if (verifyReadTries++ < VERIFY_READ_MAX_TRIES) {
-                Log.d(TAG, "Reporte aun no visible, reintento " + verifyReadTries);
-                nextActionAtMs = System.currentTimeMillis() + 1500L;
-                scheduleRetry(1500L);
-            } else {
-                Log.w(TAG, "Timeout esperando reporte, abortando");
+    private void startVerifyReadAsync() {
+        new Thread(() -> {
+            // 1. Wait up to 12s for report to load
+            AccessibilityNodeInfo root = null;
+            long deadline = System.currentTimeMillis() + 12000L;
+            while (System.currentTimeMillis() < deadline) {
+                root = getRootInActiveWindow();
+                if (root != null && isReportLoaded(root)) break;
+                root = null;
+                sleep(1000);
+            }
+
+            if (root == null) {
+                Log.w(TAG, "Reporte no cargó — abortando");
+                mainHandler.post(() -> {
+                    performGlobalAction(GLOBAL_ACTION_BACK);
+                    showStatus("Reporte no disponible");
+                    state = State.IDLE;
+                    schedulePoll(POLL_INTERVAL_MS);
+                });
+                return;
+            }
+
+            // 2. Scroll through all entries (up to 20 scrolls)
+            Map<String, Integer> entries = new LinkedHashMap<>();
+            for (int scroll = 0; scroll < 20; scroll++) {
+                root = getRootInActiveWindow();
+                if (root == null) break;
+                collectReportEntries(root, entries);
+
+                AccessibilityNodeInfo scrollable = findScrollable(root);
+                if (scrollable == null) break;
+                boolean scrolled = scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
+                if (!scrolled) break;
+                sleep(600);
+            }
+            // One final read after last scroll
+            root = getRootInActiveWindow();
+            if (root != null) collectReportEntries(root, entries);
+
+            Log.i(TAG, "Entradas reporte: " + entries);
+
+            // 3. Match with history
+            final boolean[] anyChanged = {false};
+            for (Map.Entry<String, Integer> e : entries.entrySet()) {
+                if (e.getValue() > 0) {
+                    boolean changed = HistoryStorage.markVerifiedByReference(
+                            ZasAccessibilityService.this, e.getKey());
+                    if (changed) anyChanged[0] = true;
+                    Log.i(TAG, "Verificado: " + e.getKey() + " pagos=" + e.getValue());
+                }
+            }
+
+            mainHandler.post(() -> {
+                if (anyChanged[0]) sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
                 performGlobalAction(GLOBAL_ACTION_BACK);
+                showStatus(anyChanged[0] ? "Pagos verificados" : "Sin pagos nuevos");
                 state = State.IDLE;
                 schedulePoll(POLL_INTERVAL_MS);
-            }
-            return;
-        }
+            });
+        }).start();
+    }
 
-        // 2. Check content is loaded — must have at least one "Motivo" or "Bs" entry
+    /** Returns true when the report title AND at least one entry are visible. */
+    private boolean isReportLoaded(AccessibilityNodeInfo root) {
+        if (findLabel(root, "Reporte por Cobros QR") == null
+                && findLabel(root, "Cobros QR") == null) return false;
         List<String> texts = new ArrayList<>();
         collectTexts(root, texts);
-        boolean hasContent = false;
         for (String t : texts) {
             String tl = t.trim().toLowerCase();
-            if (tl.startsWith("motivo ") || (tl.startsWith("bs") && tl.length() > 3)) {
-                hasContent = true;
-                break;
-            }
+            if (tl.startsWith("motivo") || tl.startsWith("pagos recibidos")) return true;
         }
+        return false;
+    }
 
-        if (!hasContent) {
-            if (verifyReadTries++ < VERIFY_READ_MAX_TRIES) {
-                Log.d(TAG, "Reporte vacio aun, reintento " + verifyReadTries);
-                nextActionAtMs = System.currentTimeMillis() + 1500L;
-                scheduleRetry(1500L);
-            } else {
-                // Screen loaded but empty — no QRs generated yet, that's fine
-                Log.i(TAG, "Reporte sin entradas");
-                performGlobalAction(GLOBAL_ACTION_BACK);
-                showStatus("Sin reportes aun");
-                state = State.IDLE;
-                schedulePoll(POLL_INTERVAL_MS);
-            }
-            return;
-        }
+    /**
+     * Parses visible report entries into map motivo→pagosRecibidos.
+     * Handles two layouts:
+     *   A) single node: "Motivo XXXXX"   followed by  "Pagos recibidos: N"
+     *   B) two nodes:   "Motivo" then next sibling "XXXXX"
+     */
+    private void collectReportEntries(AccessibilityNodeInfo root, Map<String, Integer> out) {
+        List<String> texts = new ArrayList<>();
+        collectTexts(root, texts);
 
-        // 3. Content is loaded — parse and match
-        verifyReadTries = 0;
-        boolean anyChanged = false;
         String pendingMotivo = null;
+        boolean expectValue  = false;
 
-        for (String text : texts) {
-            String t  = text.trim();
+        for (String raw : texts) {
+            String t  = raw.trim();
             String tl = t.toLowerCase();
 
-            if (tl.startsWith("motivo ")) {
+            if (tl.equals("motivo")) {
+                // layout B: next non-empty node is the value
+                expectValue  = true;
+                pendingMotivo = null;
+                continue;
+            }
+            if (expectValue && !tl.isEmpty() && !tl.startsWith("bs") && !tl.startsWith("pagos")) {
+                pendingMotivo = t;
+                expectValue   = false;
+                continue;
+            }
+            expectValue = false;
+
+            if (tl.startsWith("motivo ") && t.length() > 7) {
+                // layout A: value in same node
                 pendingMotivo = t.substring(7).trim();
-            } else if (pendingMotivo != null && tl.startsWith("pagos recibidos:")) {
+                continue;
+            }
+            if (pendingMotivo != null && tl.startsWith("pagos recibidos")) {
+                String numStr = tl.replaceAll("[^0-9]", "").trim();
                 try {
-                    int count = Integer.parseInt(tl.replace("pagos recibidos:", "").trim());
-                    if (count > 0) {
-                        boolean changed = HistoryStorage.markVerifiedByReference(this, pendingMotivo);
-                        if (changed) anyChanged = true;
-                        Log.i(TAG, "Verificado: " + pendingMotivo + " pagos=" + count);
-                    }
+                    int count = numStr.isEmpty() ? 0 : Integer.parseInt(numStr);
+                    out.merge(pendingMotivo, count, Integer::sum);
                 } catch (NumberFormatException ignored) {}
                 pendingMotivo = null;
             }
         }
+    }
 
-        if (anyChanged) sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
-
-        performGlobalAction(GLOBAL_ACTION_BACK);
-        showStatus(anyChanged ? "Pagos verificados" : "Sin pagos nuevos");
-        state = State.IDLE;
-        schedulePoll(POLL_INTERVAL_MS);
+    private AccessibilityNodeInfo findScrollable(AccessibilityNodeInfo n) {
+        if (n == null) return null;
+        if (n.isScrollable()) return n;
+        for (int i = 0; i < n.getChildCount(); i++) {
+            AccessibilityNodeInfo f = findScrollable(n.getChild(i));
+            if (f != null) return f;
+        }
+        return null;
     }
 
     private void collectTexts(AccessibilityNodeInfo n, List<String> out) {
@@ -718,7 +774,7 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     private void retryProcess() {
-        if (state == State.IDLE || state == State.DECODING) return;
+        if (state == State.IDLE || state == State.DECODING || state == State.VERIFY_READ) return;
         process(getRootInActiveWindow());
     }
 

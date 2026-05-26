@@ -10,13 +10,23 @@ android {
         applicationId "com.eveta.zasqr"
         minSdk 24
         targetSdk 35
-        versionCode 3
-        versionName "3.0"
+        versionCode 7
+        versionName "7.0"
+    }
+
+    signingConfigs {
+        release {
+            storeFile     file(System.getenv("KEYSTORE_PATH") ?: "zasqr-release.jks")
+            storePassword System.getenv("KEYSTORE_PASS")  ?: "zasqr123"
+            keyAlias      System.getenv("KEY_ALIAS")      ?: "zasqr"
+            keyPassword   System.getenv("KEY_PASS")       ?: "zasqr123"
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }

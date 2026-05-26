@@ -26,12 +26,20 @@ jobs:
       - name: Remove Termux-specific aapt2 path
         run: sed -i '/aapt2FromMavenOverride/d' gradle.properties
 
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > zasqr-release.jks
+
+      - name: Build signed APK
+        run: gradle assembleRelease --no-daemon
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/zasqr-release.jks
+          KEYSTORE_PASS: zasqr123
+          KEY_ALIAS: zasqr
+          KEY_PASS: zasqr123
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: zas-mvp-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 7
+          name: zas-qrg-release
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
