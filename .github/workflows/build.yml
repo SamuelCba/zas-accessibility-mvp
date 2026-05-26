@@ -21,7 +21,10 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.13'
+
+      - name: Remove Termux-specific aapt2 path
+        run: sed -i '/aapt2FromMavenOverride/d' gradle.properties
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
