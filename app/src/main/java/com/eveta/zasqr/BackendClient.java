@@ -1,4 +1,4 @@
-package com.example.zasmvp;
+package com.eveta.zasqr;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -12,16 +12,15 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 class BackendClient {
-    static final String PREFS      = "zas_prefs";
+    static final String PREFS      = "zasqr_prefs";
     static final String KEY_TOKEN  = "qrgen_token";
     static final String KEY_WORKER = "worker_id";
-    static final String KEY_PROV   = "provider";
 
-    private static final String BASE = "https://eveta-core.vercel.app/api/v1";
+    private static final String BASE     = "https://eveta-core.vercel.app/api/v1";
+    private static final String PROVIDER = "bnb";
 
     static String token(Context c)    { return prefs(c).getString(KEY_TOKEN,  ""); }
     static String workerId(Context c) { return prefs(c).getString(KEY_WORKER, "bnb"); }
-    static String provider(Context c) { return prefs(c).getString(KEY_PROV,   "bnb"); }
     static SharedPreferences prefs(Context c) {
         return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
@@ -46,7 +45,7 @@ class BackendClient {
     static boolean submitQrPayload(Context ctx, String topupId, String payload) throws Exception {
         String body = new JSONObject()
                 .put("topup_id", topupId)
-                .put("provider", provider(ctx))
+                .put("provider", PROVIDER)
                 .put("qr_payload", payload)
                 .toString();
         JSONObject resp = post(ctx, "/qrgen/submit-qr-payload", body);

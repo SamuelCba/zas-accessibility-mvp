@@ -18,5 +18,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ZasAccessibilityMvp"
+rootProject.name = "ZasQRG"
 include ':app'

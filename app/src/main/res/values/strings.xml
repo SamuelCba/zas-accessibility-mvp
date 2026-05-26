@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ZAS MVP</string>
-    <string name="accessibility_service_name">ZAS Accessibility MVP</string>
+    <string name="app_name">ZAS QRG</string>
+    <string name="accessibility_service_name">ZAS QRG</string>
     <string name="accessibility_service_description">Prueba local para leer la UI de ZAS y tocar botones detectados.</string>
     <string name="service_connected">Servicio conectado</string>
     <string name="service_disconnected">Servicio desconectado</string>

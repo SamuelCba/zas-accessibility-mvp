@@ -1,4 +1,4 @@
-package com.example.zasmvp;
+package com.eveta.zasqr;
 
 import android.view.LayoutInflater;
 import android.view.View;

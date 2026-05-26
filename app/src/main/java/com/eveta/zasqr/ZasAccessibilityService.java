@@ -1,4 +1,4 @@
-package com.example.zasmvp;
+package com.eveta.zasqr;
 
 import android.accessibilityservice.AccessibilityService;
 import android.content.ContentUris;
@@ -37,11 +37,11 @@ import java.util.List;
 
 public class ZasAccessibilityService extends AccessibilityService {
 
-    private static final String TAG         = "ZasService";
+    private static final String TAG         = "ZasQRG";
     private static final String ZAS_PACKAGE = "bec.vdb.direct";
-    private static final long   ACTION_DELAY_MS = 900L;
+    private static final long   ACTION_DELAY_MS  = 900L;
     private static final long   POLL_INTERVAL_MS = 3000L;
-    static final String         ACTION_HISTORY_UPDATED = "com.example.zasmvp.HISTORY_UPDATED";
+    static final String         ACTION_HISTORY_UPDATED = "com.eveta.zasqr.HISTORY_UPDATED";
 
     private static ZasAccessibilityService instance;
 
@@ -62,7 +62,8 @@ public class ZasAccessibilityService extends AccessibilityService {
     private long    nextActionAtMs;
 
     private BackendClient.TopupData currentTopup;
-    private long    preGenQrDateAdded; // DATE_ADDED of newest QR before we started generating
+    // Max MediaStore _ID of QR images seen before we started generating
+    private long preGenMaxQrId = -1L;
 
     private WindowManager windowManager;
     private TextView      statusPopup;
@@ -72,14 +73,14 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     public static ZasAccessibilityService getInstance() { return instance; }
 
-    // ─── Lifecycle ──────────────────────────────────────────────────────────
+    // ─── Lifecycle ───────────────────────────────────────────────────────────
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        showStatus("Servicio ZAS conectado");
+        showStatus("ZAS QRG conectado");
         schedulePoll(POLL_INTERVAL_MS);
     }
 
@@ -93,23 +94,7 @@ public class ZasAccessibilityService extends AccessibilityService {
 
     @Override public void onInterrupt() {}
 
-    // ─── Public API ─────────────────────────────────────────────────────────
-
-    public void startAutoFlow(String amt, String ref) {
-        mainHandler.removeCallbacks(pollRunnable);
-        resetFlowState(amt, ref);
-        state = State.EDITING;
-        showStatus("Iniciando automatizacion");
-        Intent i = getPackageManager().getLaunchIntentForPackage(ZAS_PACKAGE);
-        if (i == null) {
-            i = new Intent(Intent.ACTION_MAIN);
-            i.setClassName(ZAS_PACKAGE, ZAS_PACKAGE + ".MainActivity");
-        }
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        startActivity(i);
-    }
-
-    // ─── Backend polling ────────────────────────────────────────────────────
+    // ─── Backend polling ─────────────────────────────────────────────────────
 
     private void schedulePoll(long delayMs) {
         mainHandler.removeCallbacks(pollRunnable);
@@ -125,18 +110,40 @@ public class ZasAccessibilityService extends AccessibilityService {
             try {
                 BackendClient.TopupData topup = BackendClient.getNextTopup(this);
                 mainHandler.post(() -> {
-                    if (topup != null && state == State.IDLE) {
-                        currentTopup = topup;
-                        startAutoFlow(topup.amount, topup.reference);
-                    } else {
+                    if (topup == null || state != State.IDLE) {
                         schedulePoll(POLL_INTERVAL_MS);
+                        return;
                     }
+                    // Skip if already processed (dedup)
+                    if (HistoryStorage.alreadyProcessed(this, topup.id)) {
+                        Log.w(TAG, "Topup " + topup.id + " ya procesado, saltando");
+                        schedulePoll(POLL_INTERVAL_MS);
+                        return;
+                    }
+                    currentTopup = topup;
+                    startAutoFlow(topup.amount, topup.reference);
                 });
             } catch (Exception e) {
                 Log.w(TAG, "poll error: " + e.getMessage());
                 mainHandler.postDelayed(pollRunnable, POLL_INTERVAL_MS);
             }
         }).start();
+    }
+
+    // ─── Public API ──────────────────────────────────────────────────────────
+
+    public void startAutoFlow(String amt, String ref) {
+        mainHandler.removeCallbacks(pollRunnable);
+        resetFlowState(amt, ref);
+        state = State.EDITING;
+        showStatus("Iniciando: " + amt + " / " + ref);
+        Intent i = getPackageManager().getLaunchIntentForPackage(ZAS_PACKAGE);
+        if (i == null) {
+            i = new Intent(Intent.ACTION_MAIN);
+            i.setClassName(ZAS_PACKAGE, ZAS_PACKAGE + ".MainActivity");
+        }
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(i);
     }
 
     // ─── Accessibility events ────────────────────────────────────────────────
@@ -165,30 +172,33 @@ public class ZasAccessibilityService extends AccessibilityService {
 
         switch (state) {
             case EDITING:
-                if (openEditor(root)) advance(State.FILLING, ACTION_DELAY_MS, "Entrando al editor");
+                if (openEditor(root)) advance(State.FILLING, ACTION_DELAY_MS, "Abriendo formulario");
                 break;
             case FILLING:
-                if (fillForm(root)) advance(State.CONFIGURING, ACTION_DELAY_MS, "Monto y motivo listos");
+                if (fillForm(root)) advance(State.CONFIGURING, ACTION_DELAY_MS, "Monto y motivo OK");
                 break;
             case CONFIGURING:
-                if (configureForm(root)) advance(State.GENERATING, ACTION_DELAY_MS, "Configuracion completa");
+                if (configureForm(root)) advance(State.GENERATING, ACTION_DELAY_MS, "Config OK");
                 break;
             case GENERATING:
-                preGenQrDateAdded = getLatestQrDateAdded();
-                if (clickByLabels(root, "Generar")) advance(State.WAITING_FOR_SAVE, 1500L, "Generando QR");
+                // Snapshot max QR _ID right before clicking Generar
+                preGenMaxQrId = getMaxQrId();
+                if (clickByLabels(root, "Generar")) {
+                    advance(State.WAITING_FOR_SAVE, 1500L, "Generando QR...");
+                }
                 break;
             case WAITING_FOR_SAVE:
-                if (saveResult(root)) advance(State.DECODING, ACTION_DELAY_MS, "QR guardado, decodificando");
+                if (saveResult(root)) advance(State.DECODING, ACTION_DELAY_MS, "Guardando imagen...");
                 break;
             case DECODING:
-                // handled by background thread started in advance()
+                // background thread handles this
                 break;
             case SAVING:
-                if (openEditor(root)) advance(State.RESETTING, ACTION_DELAY_MS, "Volviendo a limpiar");
+                if (openEditor(root)) advance(State.RESETTING, ACTION_DELAY_MS, "Limpiando...");
                 break;
             case RESETTING:
                 if (clickByLabels(root, "Limpiar")) {
-                    showStatus("Ciclo finalizado");
+                    showStatus("Ciclo completo");
                     state = State.IDLE;
                     schedulePoll(POLL_INTERVAL_MS);
                 }
@@ -207,41 +217,38 @@ public class ZasAccessibilityService extends AccessibilityService {
         }
     }
 
-    // ─── Decode & submit (background) ────────────────────────────────────────
+    // ─── Decode & submit ─────────────────────────────────────────────────────
 
     private void startDecodeAndSubmit() {
+        final long snapshotId = preGenMaxQrId;
         new Thread(() -> {
-            // Wait for gallery to pick up the new image
-            sleep(2500);
+            // Wait 3s for gallery to index the saved image
+            sleep(3000);
 
             String payload = null;
-            long deadline = System.currentTimeMillis() + 10000;
+            long deadline = System.currentTimeMillis() + 15000;
             while (System.currentTimeMillis() < deadline) {
-                payload = findAndDecodeNewQr(preGenQrDateAdded);
+                payload = findAndDecodeQrAfter(snapshotId);
                 if (payload != null) break;
-                sleep(1200);
+                Log.d(TAG, "QR no encontrado aun, reintentando...");
+                sleep(1500);
             }
 
-            final String qrPayload   = payload != null ? payload : "";
-            final boolean hasPayload  = !qrPayload.isEmpty();
+            final String qrPayload  = payload != null ? payload : "";
+            final boolean hasPayload = !qrPayload.isEmpty();
 
-            if (hasPayload) {
-                Log.i(TAG, "QR decodificado: " + qrPayload);
-            } else {
-                Log.w(TAG, "No se pudo decodificar QR nuevo");
-            }
+            Log.i(TAG, hasPayload ? "QR decodificado: " + qrPayload : "No se decodifico QR");
 
             boolean submitted = false;
             if (hasPayload && currentTopup != null) {
                 try {
                     submitted = BackendClient.submitQrPayload(this, currentTopup.id, qrPayload);
-                    Log.i(TAG, "Submit result: " + submitted);
+                    Log.i(TAG, "Submit: " + submitted);
                 } catch (Exception e) {
                     Log.e(TAG, "Submit error: " + e.getMessage());
                 }
             }
 
-            // Save to history
             if (currentTopup != null) {
                 HistoryEntry entry = new HistoryEntry();
                 entry.topupId     = currentTopup.id;
@@ -255,45 +262,45 @@ public class ZasAccessibilityService extends AccessibilityService {
                 sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
             }
 
-            final boolean finalSubmitted = submitted;
+            final boolean ok = submitted;
             mainHandler.post(() -> {
-                showStatus(finalSubmitted ? "QR enviado OK" : (hasPayload ? "QR decoded, submit fallido" : "Sin QR, continuando"));
+                showStatus(ok ? "Enviado OK" : (hasPayload ? "Decode OK, submit fallo" : "Sin QR decodificado"));
                 currentTopup = null;
-                advance(State.SAVING, ACTION_DELAY_MS, "Limpiando formulario");
+                advance(State.SAVING, ACTION_DELAY_MS, "Volviendo al formulario");
             });
         }).start();
     }
 
     // ─── MediaStore + ZXing ──────────────────────────────────────────────────
 
-    private long getLatestQrDateAdded() {
-        String[] proj = {MediaStore.Images.Media.DATE_ADDED};
-        String sel = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'";
+    /** Returns the highest _ID among QR* images currently in the gallery, or -1 if none. */
+    private long getMaxQrId() {
+        String[] proj = {MediaStore.Images.Media._ID};
+        String   sel  = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'";
         try (Cursor c = getContentResolver().query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, sel, null,
-                MediaStore.Images.Media.DATE_ADDED + " DESC")) {
-            if (c != null && c.moveToFirst()) {
-                return c.getLong(0);
-            }
-        } catch (Exception ignored) {}
-        return 0;
+                MediaStore.Images.Media._ID + " DESC")) {
+            if (c != null && c.moveToFirst()) return c.getLong(0);
+        } catch (Exception e) { Log.w(TAG, "getMaxQrId: " + e.getMessage()); }
+        return -1L;
     }
 
-    private String findAndDecodeNewQr(long afterDateAdded) {
-        String[] proj = {MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED};
-        String sel = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'"
-                   + " AND " + MediaStore.Images.Media.DATE_ADDED + " > " + afterDateAdded;
+    /** Finds the first QR* image with _ID > snapshotId and decodes it. */
+    private String findAndDecodeQrAfter(long snapshotId) {
+        String[] proj = {MediaStore.Images.Media._ID};
+        String   sel  = MediaStore.Images.Media.DISPLAY_NAME + " LIKE 'QR%'"
+                      + " AND " + MediaStore.Images.Media._ID + " > " + snapshotId;
         try (Cursor c = getContentResolver().query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, sel, null,
-                MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+                MediaStore.Images.Media._ID + " DESC")) {
             if (c != null && c.moveToFirst()) {
                 long id  = c.getLong(0);
-                Uri uri  = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                Uri  uri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                Log.d(TAG, "QR image found _ID=" + id + " uri=" + uri);
                 return decodeQrUri(uri);
             }
-        } catch (Exception e) {
-            Log.w(TAG, "MediaStore query error: " + e.getMessage());
-        }
+        } catch (Exception e) { Log.w(TAG, "findQr: " + e.getMessage()); }
         return null;
     }
 
@@ -306,12 +313,12 @@ public class ZasAccessibilityService extends AccessibilityService {
             int[] pixels = new int[w * h];
             bmp.getPixels(pixels, 0, w, 0, 0, w, h);
             bmp.recycle();
-            RGBLuminanceSource src = new RGBLuminanceSource(w, h, pixels);
-            BinaryBitmap bin = new BinaryBitmap(new HybridBinarizer(src));
+            BinaryBitmap bin = new BinaryBitmap(
+                    new HybridBinarizer(new RGBLuminanceSource(w, h, pixels)));
             Result result = new QRCodeReader().decode(bin);
             return result.getText();
         } catch (Exception e) {
-            Log.w(TAG, "ZXing decode error: " + e.getMessage());
+            Log.w(TAG, "ZXing: " + e.getMessage());
             return null;
         }
     }
@@ -319,14 +326,15 @@ public class ZasAccessibilityService extends AccessibilityService {
     // ─── Form interaction ────────────────────────────────────────────────────
 
     private boolean fillForm(AccessibilityNodeInfo root) {
-        AccessibilityNodeInfo amountField = findFieldByKeywords(root, "monto", "importe", "amount", "valor");
-        AccessibilityNodeInfo referenceField = findFieldByKeywords(root, "motivo", "referencia", "detalle", "descripcion", "glosa", "concepto");
+        AccessibilityNodeInfo amountField = findFieldByKeywords(root,
+                "monto", "importe", "amount", "valor");
+        AccessibilityNodeInfo referenceField = findFieldByKeywords(root,
+                "motivo", "referencia", "detalle", "descripcion", "glosa", "concepto");
 
         List<AccessibilityNodeInfo> fields = collectEditableFields(root);
         if (amountField == null && !fields.isEmpty()) amountField = fields.get(0);
-        if (referenceField == null && fields.size() > 1) {
+        if (referenceField == null && fields.size() > 1)
             referenceField = fields.get(amountField == fields.get(0) ? 1 : 0);
-        }
 
         if (amountField == null || referenceField == null) {
             showStatus("Campos no detectados");
@@ -341,14 +349,13 @@ public class ZasAccessibilityService extends AccessibilityService {
                 scheduleRetry(ACTION_DELAY_MS);
                 return false;
             }
-            showStatus("Monto listo para escribir");
+            showStatus("Campo monto listo");
             nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
             scheduleRetry(ACTION_DELAY_MS);
             return false;
         }
 
-        boolean amountOk = setText(amountField, amt);
-        if (!amountOk) {
+        if (!setText(amountField, amt)) {
             showStatus("Reintentando monto");
             nextActionAtMs = System.currentTimeMillis() + ACTION_DELAY_MS;
             return false;
@@ -357,7 +364,7 @@ public class ZasAccessibilityService extends AccessibilityService {
         sleep(250);
         boolean refOk = setText(referenceField, ref);
 
-        if (amountOk && refOk) {
+        if (refOk) {
             amountFieldPrepared = false;
             if (!keyboardDismissed) {
                 performGlobalAction(GLOBAL_ACTION_BACK);
@@ -403,7 +410,6 @@ public class ZasAccessibilityService extends AccessibilityService {
             }
             singleUseEnabled = true;
         }
-
         return true;
     }
 
@@ -417,26 +423,25 @@ public class ZasAccessibilityService extends AccessibilityService {
         return clickBottom(root, 1);
     }
 
-    // ─── Helper methods ──────────────────────────────────────────────────────
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
     private void resetFlowState(String newAmt, String newRef) {
-        this.amt              = sanitizeAmount(newAmt);
-        this.ref              = sanitizeReference(newRef);
-        this.validitySelected = false;
-        this.singleUseEnabled = false;
+        this.amt               = sanitizeAmount(newAmt);
+        this.ref               = sanitizeReference(newRef);
+        this.validitySelected  = false;
+        this.singleUseEnabled  = false;
         this.amountFieldPrepared = false;
         this.keyboardDismissed = false;
-        this.nextActionAtMs   = 0L;
+        this.nextActionAtMs    = 0L;
+        this.preGenMaxQrId     = -1L;
         mainHandler.removeCallbacks(retryRunnable);
     }
 
     private boolean primeAmountField(AccessibilityNodeInfo node) {
         if (node == null) return false;
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-        boolean f = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        sleep(260);
-        boolean s = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        sleep(260);
+        boolean f = node.performAction(AccessibilityNodeInfo.ACTION_CLICK); sleep(260);
+        boolean s = node.performAction(AccessibilityNodeInfo.ACTION_CLICK); sleep(260);
         return f || s;
     }
 
@@ -477,7 +482,7 @@ public class ZasAccessibilityService extends AccessibilityService {
         List<AccessibilityNodeInfo> clickables = new ArrayList<>();
         findClickable(root, clickables);
         List<AccessibilityNodeInfo> bottom = new ArrayList<>();
-        int minTop = (int) (getResources().getDisplayMetrics().heightPixels * 0.72f);
+        int minTop = (int)(getResources().getDisplayMetrics().heightPixels * 0.72f);
         for (AccessibilityNodeInfo n : clickables) if (getBounds(n).top >= minTop) bottom.add(n);
         Collections.sort(bottom, (a, b) -> {
             int t = Integer.compare(getBounds(a).top, getBounds(b).top);
@@ -522,11 +527,11 @@ public class ZasAccessibilityService extends AccessibilityService {
         return null;
     }
 
-    private AccessibilityNodeInfo findClass(AccessibilityNodeInfo n, String c) {
+    private AccessibilityNodeInfo findClass(AccessibilityNodeInfo n, String cls) {
         if (n == null) return null;
-        if (safe(n.getClassName()).equals(c)) return n;
+        if (safe(n.getClassName()).equals(cls)) return n;
         for (int i = 0; i < n.getChildCount(); i++) {
-            AccessibilityNodeInfo f = findClass(n.getChild(i), c);
+            AccessibilityNodeInfo f = findClass(n.getChild(i), cls);
             if (f != null) return f;
         }
         return null;
@@ -562,20 +567,19 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     private boolean matchesText(AccessibilityNodeInfo n, String kw) {
-        return containsNorm(safe(n != null ? n.getText() : null), kw)
-            || containsNorm(safe(n != null ? n.getContentDescription() : null), kw)
-            || containsNorm(getHint(n), kw);
+        return cn(safe(n != null ? n.getText() : null), kw)
+            || cn(safe(n != null ? n.getContentDescription() : null), kw)
+            || cn(getHint(n), kw);
     }
 
     private boolean matchesAny(AccessibilityNodeInfo n, String... kws) {
         if (n == null) return false;
-        for (String kw : kws) {
-            if (matchesText(n, kw) || containsNorm(safe(n.getViewIdResourceName()), kw)) return true;
-        }
+        for (String kw : kws)
+            if (matchesText(n, kw) || cn(safe(n.getViewIdResourceName()), kw)) return true;
         return false;
     }
 
-    private boolean containsNorm(String src, String needle) { return norm(src).contains(norm(needle)); }
+    private boolean cn(String src, String needle) { return norm(src).contains(norm(needle)); }
     private String norm(String v) {
         return safe(v).toLowerCase()
                 .replace("á","a").replace("é","e").replace("í","i")
@@ -615,7 +619,7 @@ public class ZasAccessibilityService extends AccessibilityService {
         return s.isEmpty() ? "PAGO_AUTO" : s;
     }
 
-    // ─── Status popup ────────────────────────────────────────────────────────
+    // ─── Status popup ─────────────────────────────────────────────────────────
 
     private void showStatus(String msg) {
         Log.i(TAG, msg);
@@ -661,14 +665,14 @@ public class ZasAccessibilityService extends AccessibilityService {
         });
     }
 
-    // ─── Tiny utils ──────────────────────────────────────────────────────────
+    // ─── Micro utils ──────────────────────────────────────────────────────────
 
-    private Rect getBounds(AccessibilityNodeInfo n) { Rect r = new Rect(); n.getBoundsInScreen(r); return r; }
+    private Rect   getBounds(AccessibilityNodeInfo n) { Rect r = new Rect(); n.getBoundsInScreen(r); return r; }
     private String getHint(AccessibilityNodeInfo n) {
         if (n == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return "";
         return safe(n.getHintText());
     }
     private String safe(CharSequence v) { return v == null ? "" : v.toString(); }
-    private void sleep(long ms) { try { Thread.sleep(ms); } catch (Exception ignored) {} }
-    private void showToast(String m) { mainHandler.post(() -> Toast.makeText(this, m, Toast.LENGTH_SHORT).show()); }
+    private void   sleep(long ms)       { try { Thread.sleep(ms); } catch (Exception ignored) {} }
+    private void   showToast(String m)  { mainHandler.post(() -> Toast.makeText(this, m, Toast.LENGTH_SHORT).show()); }
 }

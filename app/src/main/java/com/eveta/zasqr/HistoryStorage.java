@@ -1,4 +1,4 @@
-package com.example.zasmvp;
+package com.eveta.zasqr;
 
 import android.content.Context;
 
@@ -34,6 +34,16 @@ class HistoryStorage {
         BackendClient.prefs(ctx).edit().remove(KEY).apply();
     }
 
+    static boolean alreadyProcessed(Context ctx, String topupId) {
+        try {
+            JSONArray arr = load(ctx);
+            for (int i = 0; i < arr.length(); i++) {
+                if (topupId.equals(arr.getJSONObject(i).optString("id"))) return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
     static List<HistoryEntry> getAll(Context ctx) {
         List<HistoryEntry> list = new ArrayList<>();
         try {
@@ -41,13 +51,13 @@ class HistoryStorage {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
                 HistoryEntry e = new HistoryEntry();
-                e.topupId    = o.optString("id");
-                e.amount     = o.optString("amount");
-                e.reference  = o.optString("ref");
-                e.concept    = o.optString("concept");
-                e.qrPayload  = o.optString("payload");
-                e.timestampMs= o.optLong("ts");
-                e.submitted  = o.optBoolean("ok");
+                e.topupId     = o.optString("id");
+                e.amount      = o.optString("amount");
+                e.reference   = o.optString("ref");
+                e.concept     = o.optString("concept");
+                e.qrPayload   = o.optString("payload");
+                e.timestampMs = o.optLong("ts");
+                e.submitted   = o.optBoolean("ok");
                 list.add(e);
             }
         } catch (Exception ignored) {}
@@ -56,8 +66,7 @@ class HistoryStorage {
 
     private static JSONArray load(Context ctx) {
         try {
-            String s = BackendClient.prefs(ctx).getString(KEY, "[]");
-            return new JSONArray(s);
+            return new JSONArray(BackendClient.prefs(ctx).getString(KEY, "[]"));
         } catch (Exception e) { return new JSONArray(); }
     }
 }
