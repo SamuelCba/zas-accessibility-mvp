@@ -1,0 +1,9 @@
+/build
+/.gradle
+/.android-sdk
+/.android-sdk-official
+/local.properties
+.DS_Store
+/app/build
+/app-debug.apk
+artifacts/

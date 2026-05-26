@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ZAS MVP</string>
+    <string name="accessibility_service_name">ZAS Accessibility MVP</string>
+    <string name="accessibility_service_description">Prueba local para leer la UI de ZAS y tocar botones detectados.</string>
+    <string name="service_connected">Servicio conectado</string>
+    <string name="service_disconnected">Servicio desconectado</string>
+    <string name="open_accessibility_settings">Abrir ajustes de accesibilidad</string>
+    <string name="open_zas">Abrir ZAS</string>
+    <string name="inspect_window">Inspeccionar ventana actual</string>
+    <string name="find_ingresar">Buscar boton Ingresar</string>
+    <string name="tap_ingresar">Tocar boton Ingresar</string>
+    <string name="tap_initial">Tap Inicial (Navegacion)</string>
+    <string name="find_qr_buttons">Buscar botones del bloque QR</string>
+    <string name="tap_left_qr_button">Tocar accion izquierda del QR</string>
+    <string name="set_amount">Setear Monto (5.00)</string>
+    <string name="set_reference">Setear Referencia (REF123)</string>
+    <string name="tap_generate">Tocar Generar</string>
+    <string name="tap_save">Tocar Guardar</string>
+    <string name="run_sequence">Ejecutar Secuencia Completa</string>
+</resources>
