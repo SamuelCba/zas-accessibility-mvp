@@ -67,7 +67,9 @@ public class ZasAccessibilityService extends AccessibilityService {
     private BackendClient.TopupData currentTopup;
 
     // Verification
-    private long lastVerifyAtMs = 0L;
+    private long lastVerifyAtMs   = 0L;
+    private int  verifyReadTries  = 0;
+    private static final int VERIFY_READ_MAX_TRIES = 8; // 8 × 1.5s = 12s max
 
     private WindowManager windowManager;
     private TextView      statusPopup;
@@ -154,6 +156,7 @@ public class ZasAccessibilityService extends AccessibilityService {
     }
 
     private void startVerification() {
+        verifyReadTries = 0;
         state = State.VERIFY_NAV;
         showStatus("Verificando pagos...");
         launchZas(true);
@@ -247,7 +250,7 @@ public class ZasAccessibilityService extends AccessibilityService {
                 break;
             case VERIFY_SELECT:
                 if (clickByLabels(root, "por Cobro QR", "Cobro QR")) {
-                    advance(State.VERIFY_READ, 900L, "Leyendo reporte");
+                    advance(State.VERIFY_READ, 2000L, "Cargando reporte...");
                 }
                 break;
             case VERIFY_READ:
@@ -270,14 +273,56 @@ public class ZasAccessibilityService extends AccessibilityService {
     // ─── Verification read ───────────────────────────────────────────────────
 
     private void doVerifyRead(AccessibilityNodeInfo root) {
+        // 1. Confirm we're on the right screen
+        if (findLabel(root, "Reporte por Cobros QR") == null) {
+            if (verifyReadTries++ < VERIFY_READ_MAX_TRIES) {
+                Log.d(TAG, "Reporte aun no visible, reintento " + verifyReadTries);
+                nextActionAtMs = System.currentTimeMillis() + 1500L;
+                scheduleRetry(1500L);
+            } else {
+                Log.w(TAG, "Timeout esperando reporte, abortando");
+                performGlobalAction(GLOBAL_ACTION_BACK);
+                state = State.IDLE;
+                schedulePoll(POLL_INTERVAL_MS);
+            }
+            return;
+        }
+
+        // 2. Check content is loaded — must have at least one "Motivo" or "Bs" entry
         List<String> texts = new ArrayList<>();
         collectTexts(root, texts);
+        boolean hasContent = false;
+        for (String t : texts) {
+            String tl = t.trim().toLowerCase();
+            if (tl.startsWith("motivo ") || (tl.startsWith("bs") && tl.length() > 3)) {
+                hasContent = true;
+                break;
+            }
+        }
 
+        if (!hasContent) {
+            if (verifyReadTries++ < VERIFY_READ_MAX_TRIES) {
+                Log.d(TAG, "Reporte vacio aun, reintento " + verifyReadTries);
+                nextActionAtMs = System.currentTimeMillis() + 1500L;
+                scheduleRetry(1500L);
+            } else {
+                // Screen loaded but empty — no QRs generated yet, that's fine
+                Log.i(TAG, "Reporte sin entradas");
+                performGlobalAction(GLOBAL_ACTION_BACK);
+                showStatus("Sin reportes aun");
+                state = State.IDLE;
+                schedulePoll(POLL_INTERVAL_MS);
+            }
+            return;
+        }
+
+        // 3. Content is loaded — parse and match
+        verifyReadTries = 0;
         boolean anyChanged = false;
         String pendingMotivo = null;
 
         for (String text : texts) {
-            String t = text.trim();
+            String t  = text.trim();
             String tl = t.toLowerCase();
 
             if (tl.startsWith("motivo ")) {
