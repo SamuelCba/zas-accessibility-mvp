@@ -279,13 +279,14 @@ public class ZasAccessibilityService extends AccessibilityService {
     // ─── Verification read (event-driven) ───────────────────────────────────
 
     private void doVerifyStep(AccessibilityNodeInfo root) {
-        // Wait for report screen to load (up to 5s)
-        if (!isReportLoaded(root)) {
+        // Wait for report screen to load (up to 6s)
+        if (!isReportScreenVisible(root)) {
             verifyLoadTries++;
-            if (verifyLoadTries > 5) {
-                Log.i(TAG, "Reporte sin contenido — finalizando");
-                finalizeVerification();
+            if (verifyLoadTries > 6) {
+                showStatus("Reporte no disponible");
+                finalizeVerification(root);
             } else {
+                showStatus("Esperando reporte... (" + verifyLoadTries + ")");
                 nextActionAtMs = System.currentTimeMillis() + 1000L;
                 scheduleRetry(1000L);
             }
@@ -294,89 +295,98 @@ public class ZasAccessibilityService extends AccessibilityService {
 
         verifyLoadTries = 0;
 
-        // Collect entries visible right now
+        // Collect entries visible right now using line-based parsing
+        int before = verifyEntries.size();
         collectReportEntries(root, verifyEntries);
-        Log.d(TAG, "Scroll " + verifyScrollsDone + " — entradas: " + verifyEntries);
+        int after = verifyEntries.size();
+        showStatus("Reporte: " + after + " entradas (scroll " + verifyScrollsDone + ")");
+        Log.d(TAG, "Scroll " + verifyScrollsDone + " entradas=" + verifyEntries);
 
         // Try to scroll further
-        if (verifyScrollsDone < 25) {
+        if (verifyScrollsDone < 30) {
             AccessibilityNodeInfo scrollable = findScrollable(root);
             if (scrollable != null) {
                 boolean scrolled = scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
                 if (scrolled) {
                     verifyScrollsDone++;
-                    nextActionAtMs = System.currentTimeMillis() + 700L;
-                    scheduleRetry(700L);
+                    nextActionAtMs = System.currentTimeMillis() + 800L;
+                    scheduleRetry(800L);
                     return;
                 }
             }
         }
 
-        // No more scroll — done
-        finalizeVerification();
+        // No more scroll or reached limit — done
+        finalizeVerification(root);
     }
 
-    private void finalizeVerification() {
+    private void finalizeVerification(AccessibilityNodeInfo root) {
         boolean anyChanged = false;
         for (Map.Entry<String, Integer> e : verifyEntries.entrySet()) {
             if (e.getValue() > 0) {
                 boolean changed = HistoryStorage.markVerifiedByReference(this, e.getKey());
                 if (changed) anyChanged = true;
-                Log.i(TAG, "Verificado: " + e.getKey() + " pagos=" + e.getValue());
+                Log.i(TAG, "match: " + e.getKey() + " pagos=" + e.getValue());
             }
         }
         if (anyChanged) sendBroadcast(new Intent(ACTION_HISTORY_UPDATED));
+        int total = verifyEntries.size();
         verifyEntries.clear();
         verifyScrollsDone = 0;
         verifyLoadTries   = 0;
-        performGlobalAction(GLOBAL_ACTION_BACK);
-        showStatus(anyChanged ? "Pagos verificados" : "Sin pagos nuevos");
+
+        // Use the in-app back arrow (←) instead of system back
+        if (root == null || !clickByLabels(root,
+                "Navegar hacia arriba", "Navigate up", "Atrás", "Atras", "Volver")) {
+            performGlobalAction(GLOBAL_ACTION_BACK);
+        }
+
+        showStatus(anyChanged ? "Pagos verificados ✓" : "Sin coincidencias (" + total + " entradas)");
         state = State.IDLE;
         schedulePoll(POLL_INTERVAL_MS);
     }
 
-    /** True when "Reporte por Cobros QR" title + at least one entry card are visible. */
-    private boolean isReportLoaded(AccessibilityNodeInfo root) {
-        if (findLabel(root, "Cobros QR") == null) return false;
-        List<String> texts = new ArrayList<>();
-        collectTexts(root, texts);
-        for (String t : texts) {
-            String tl = t.trim().toLowerCase();
-            if (tl.startsWith("motivo") || tl.startsWith("pagos recibidos")) return true;
-        }
-        return false;
+    /** True if the Cobros QR report screen title is visible (entries may still be loading). */
+    private boolean isReportScreenVisible(AccessibilityNodeInfo root) {
+        return findLabel(root, "Cobros QR") != null
+            || findLabel(root, "Reporte por") != null;
     }
 
     /**
      * Parses visible report cards → map motivo→pagosRecibidos.
-     * Layout A (one node):  "Motivo EVTAXXXXXXXX" then "Pagos recibidos: N"
-     * Layout B (two nodes): "Motivo" then "EVTAXXXXXXXX" then "Pagos recibidos: N"
+     * Each card has lines: "Bs5.00", "Motivo EVTAXXXXXXXX", "Pagos recibidos: N", ...
+     * Handles both separate nodes AND a single multi-line node (split by \n).
      */
     private void collectReportEntries(AccessibilityNodeInfo root, Map<String, Integer> out) {
-        List<String> texts = new ArrayList<>();
-        collectTexts(root, texts);
+        // collectLines splits multi-line nodes so "Bs5.00\nMotivo EVT..." is handled correctly
+        List<String> lines = new ArrayList<>();
+        collectLines(root, lines);
 
         String  pendingMotivo = null;
         boolean expectValue   = false;
 
-        for (String raw : texts) {
+        for (String raw : lines) {
             String t  = raw.trim();
             String tl = t.toLowerCase();
+            if (t.isEmpty()) continue;
 
             if (tl.equals("motivo")) {
+                // two-node layout: next line is the reference code
                 expectValue   = true;
                 pendingMotivo = null;
                 continue;
             }
             if (expectValue) {
                 expectValue = false;
-                if (!tl.isEmpty() && !tl.startsWith("bs") && !tl.startsWith("pagos")
-                        && !tl.startsWith("total") && !tl.startsWith("generado")) {
+                if (!tl.startsWith("bs") && !tl.startsWith("pagos")
+                        && !tl.startsWith("total") && !tl.startsWith("generado")
+                        && !tl.startsWith("reporte")) {
                     pendingMotivo = t;
                     continue;
                 }
             }
             if (tl.startsWith("motivo ") && t.length() > 7) {
+                // single-node layout: "Motivo EVTAXXXXXXXX"
                 pendingMotivo = t.substring(7).trim();
                 continue;
             }
@@ -384,11 +394,24 @@ public class ZasAccessibilityService extends AccessibilityService {
                 String numStr = tl.replaceAll("[^0-9]", "");
                 try {
                     int count = numStr.isEmpty() ? 0 : Integer.parseInt(numStr);
-                    out.putIfAbsent(pendingMotivo, count); // don't double-count on re-scroll
+                    out.putIfAbsent(pendingMotivo, count);
                 } catch (NumberFormatException ignored) {}
                 pendingMotivo = null;
             }
         }
+    }
+
+    /** Like collectTexts but splits each node's text by newlines — handles multi-line nodes. */
+    private void collectLines(AccessibilityNodeInfo n, List<String> out) {
+        if (n == null) return;
+        CharSequence t = n.getText();
+        if (t != null && t.length() > 0) {
+            for (String line : t.toString().split("\n")) {
+                String trimmed = line.trim();
+                if (!trimmed.isEmpty()) out.add(trimmed);
+            }
+        }
+        for (int i = 0; i < n.getChildCount(); i++) collectLines(n.getChild(i), out);
     }
 
     private AccessibilityNodeInfo findScrollable(AccessibilityNodeInfo n) {
